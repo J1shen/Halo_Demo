@@ -1,0 +1,13 @@
+[package]
+name = "halo-dev-dp-core-rs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "halo_dev_optimizers__dp_core_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+hashbrown = "0.14"
+pyo3 = { version = "0.21", features = ["extension-module", "abi3-py312"] }
