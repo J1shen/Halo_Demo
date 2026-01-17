@@ -1,0 +1,459 @@
+graph:
+  name: tpch_qbench_layered_rules_v1
+  description: >
+    TPC-H Q1–Q22-aligned workflow with RULE-BASED parameter extraction (no LLM parsing).
+    Topology: flatter "layered" DAG: Layer-1 parallel analysis -> merge -> Layer-2 parallel diagnostics -> merge -> final.
+    Models: prioritize openai/gpt-oss-20b; use Qwen3-14B for one mid-level synthesis; use Qwen3-32B for the ops backlog node.
+
+  nodes:
+    - id: user_input
+      type: input
+      outputs: [user_query]
+
+    # ===== 1) deterministic param extraction (NO LLM) =====
+    # NOTE: You can paste your full regex/enums/defaults/normalize config here (same as TPCH Trident).
+    - id: rule_param_extractor
+      type: processor
+      processor: regex_param_extractor
+      config:
+        enums:
+          region: ["AFRICA","AMERICA","ASIA","EUROPE","MIDDLE EAST"]
+          segment: ["AUTOMOBILE","BUILDING","FURNITURE","HOUSEHOLD","MACHINERY"]
+          shipmode: ["AIR","AIR REG","RAIL","SHIP","TRUCK","MAIL","FOB"]
+          orderpriority_prefix: ["1-URGENT","2-HIGH","3-MEDIUM","4-NOT SPECIFIED","5-LOW"]
+        regex:
+          date:
+            - "(?i)\\bdate\\s*[=:]\\s*([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})\\b"
+            - "(?i)\\bafter\\s+([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})\\b"
+            - "(?i)\\bbefore\\s+([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})\\b"
+          date2:
+            - "(?i)\\bdate2\\s*[=:]\\s*([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})\\b"
+            - "(?i)\\bto\\s+([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})\\b"
+          year:
+            - "(?i)\\byear\\s*[=:]\\s*(199[2-8])\\b"
+            - "(?i)\\b(199[2-8])\\b"
+          region:
+            - "(?i)\\bregion\\s*[=:]\\s*([A-Z][A-Z ]+?)\\b"
+            - "(?i)\\b(AF(RICA)?|AMERICA|ASIA|EUROPE|MIDDLE\\s+EAST)\\b"
+          nation:
+            - "(?i)\\bnation\\s*[=:]\\s*([A-Z][A-Z ]+?)\\b"
+            - "(?i)\\b(JAPAN|CHINA|INDIA|FRANCE|GERMANY|CANADA|BRAZIL|UNITED\\s+STATES|RUSSIA)\\b"
+          nation2:
+            - "(?i)\\bnation2\\s*[=:]\\s*([A-Z][A-Z ]+?)\\b"
+            - "(?i)\\bvs\\s+([A-Z][A-Z ]+?)\\b"
+          segment:
+            - "(?i)\\bsegment\\s*[=:]\\s*(AUTOMOBILE|BUILDING|FURNITURE|HOUSEHOLD|MACHINERY)\\b"
+            - "(?i)\\b(AUTOMOBILE|BUILDING|FURNITURE|HOUSEHOLD|MACHINERY)\\b"
+          brand:
+            - "(?i)\\bbrand\\s*[=:]\\s*(Brand#[0-9]{2})\\b"
+            - "(?i)\\b(Brand#[0-9]{2})\\b"
+          type:
+            - "(?i)\\btype\\s*[=:]\\s*([A-Za-z0-9_\\- ]{3,30})\\b"
+          size:
+            - "(?i)\\bsize\\s*[=:]\\s*([0-9]{1,3})\\b"
+          shipmode:
+            - "(?i)\\bshipmode\\s*[=:]\\s*(AIR\\s+REG|AIR|RAIL|SHIP|TRUCK|MAIL|FOB)\\b"
+            - "(?i)\\b(AIR\\s+REG|AIR|RAIL|SHIP|TRUCK|MAIL|FOB)\\b"
+          shipmode2:
+            - "(?i)\\bshipmode2\\s*[=:]\\s*(AIR\\s+REG|AIR|RAIL|SHIP|TRUCK|MAIL|FOB)\\b"
+          discount_lo:
+            - "(?i)\\bdiscount\\s*[=:]\\s*([0-9]*\\.?[0-9]+)\\b"
+            - "(?i)\\bdiscount_lo\\s*[=:]\\s*([0-9]*\\.?[0-9]+)\\b"
+          discount_hi:
+            - "(?i)\\bdiscount_hi\\s*[=:]\\s*([0-9]*\\.?[0-9]+)\\b"
+          qty:
+            - "(?i)\\bqty\\s*[<=>:]\\s*([0-9]{1,4})\\b"
+            - "(?i)\\bquantity\\s*[<=>:]\\s*([0-9]{1,4})\\b"
+        defaults:
+          year: 1994
+          region: "ASIA"
+          segment: "BUILDING"
+          shipmode: "MAIL"
+          shipmode2: "SHIP"
+          date: "1995-03-15"
+          discount_lo: 0.05
+          discount_hi: 0.07
+          qty: 24
+          size: 15
+          type: "BRASS"
+          brand: "Brand#13"
+          nation: "CANADA"
+          nation2: "GERMANY"
+        normalize:
+          uppercase_fields: ["region","nation","nation2","segment","shipmode","shipmode2","brand"]
+          date_fields: ["date","date2"]
+          numeric_fields: ["year","size","qty","discount_lo","discount_hi"]
+          strip_quotes: true
+      inputs: [user_query]
+      outputs: [tpch_params]
+
+    # =========================
+    # Layer 1: parallel analysis (3-way)
+    # =========================
+
+    - id: l1_ops_backlog_q4_32b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+      db_queries:
+        - name: tpch_q4_order_priority_check
+          sql: >
+            SELECT
+              o.o_orderpriority,
+              COUNT(*) AS order_count
+            FROM orders o
+            WHERE o.o_orderdate >= make_date(:year::int, 1, 1)
+              AND o.o_orderdate <  make_date(:year::int, 1, 1) + INTERVAL '3 month'
+              AND EXISTS (
+                SELECT 1
+                FROM lineitem l
+                WHERE l.l_orderkey = o.o_orderkey
+                  AND l.l_commitdate < l.l_receiptdate
+              )
+            GROUP BY o.o_orderpriority
+            ORDER BY o.o_orderpriority;
+          parameters:
+            year: "{{ tpch_params.year }}"
+          param_types:
+            year: int
+      system_prompt: |
+        Layer1-A (Ops backlog, Q4-like):
+        Summarize backlog risk from order priority distribution. Be numeric and concise.
+        Respond ONLY with: { "l1_ops_notes": "string" }
+      inputs: [user_query, tpch_params]
+      outputs: [l1_ops_notes]
+
+    - id: l1_tradeflow_q7_20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      db_queries:
+        - name: tpch_q7_volume_between_two_nations
+          sql: >
+            SELECT
+              supp_nation.n_name AS supp_nation,
+              cust_nation.n_name AS cust_nation,
+              EXTRACT(YEAR FROM l.l_shipdate)::int AS l_year,
+              SUM(l.l_extendedprice * (1 - l.l_discount)) AS revenue
+            FROM supplier s
+            JOIN nation supp_nation ON supp_nation.n_nationkey = s.s_nationkey
+            JOIN lineitem l ON l.l_suppkey = s.s_suppkey
+            JOIN orders o ON o.o_orderkey = l.l_orderkey
+            JOIN customer c ON c.c_custkey = o.o_custkey
+            JOIN nation cust_nation ON cust_nation.n_nationkey = c.c_nationkey
+            WHERE (
+                (supp_nation.n_name = :nation AND cust_nation.n_name = :nation2)
+             OR (supp_nation.n_name = :nation2 AND cust_nation.n_name = :nation)
+            )
+              AND l.l_shipdate >= make_date(:year::int, 1, 1)
+              AND l.l_shipdate <  make_date(:year::int, 1, 1) + INTERVAL '2 year'
+            GROUP BY supp_nation, cust_nation, l_year
+            ORDER BY supp_nation, cust_nation, l_year;
+          parameters:
+            nation: "{{ tpch_params.nation }}"
+            nation2: "{{ tpch_params.nation2 }}"
+            year: "{{ tpch_params.year }}"
+          param_types:
+            nation: text
+            nation2: text
+            year: int
+      system_prompt: |
+        Layer1-B (Trade flow, Q7-like):
+        Summarize revenue-by-year trade flow between the two nations.
+        Respond ONLY with: { "l1_trade_notes": "string" }
+      inputs: [user_query, tpch_params]
+      outputs: [l1_trade_notes]
+
+    - id: l1_demand_q10q18_20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      db_queries:
+        - name: tpch_q10_top_customers_returned
+          sql: >
+            SELECT
+              c.c_custkey,
+              c.c_name,
+              SUM(l.l_extendedprice * (1 - l.l_discount)) AS revenue
+            FROM customer c
+            JOIN orders o ON o.o_custkey = c.c_custkey
+            JOIN lineitem l ON l.l_orderkey = o.o_orderkey
+            WHERE l.l_returnflag = 'R'
+              AND o.o_orderdate >= make_date(:year::int, 1, 1)
+              AND o.o_orderdate <  make_date(:year::int, 1, 1) + INTERVAL '3 month'
+            GROUP BY c.c_custkey, c.c_name
+            ORDER BY revenue DESC
+            LIMIT 20;
+          parameters:
+            year: "{{ tpch_params.year }}"
+          param_types:
+            year: int
+        - name: tpch_q18_large_orders
+          sql: >
+            SELECT
+              o.o_orderkey,
+              SUM(l.l_quantity) AS sum_qty
+            FROM orders o
+            JOIN lineitem l ON l.l_orderkey = o.o_orderkey
+            GROUP BY o.o_orderkey
+            HAVING SUM(l.l_quantity) > :qty::numeric
+            ORDER BY sum_qty DESC
+            LIMIT 20;
+          parameters:
+            qty: "{{ tpch_params.qty }}"
+          param_types:
+            qty: numeric
+      system_prompt: |
+        Layer1-C (Demand concentration, Q10/Q18-like):
+        Summarize top returned-revenue customers and identify large orders above qty threshold.
+        Respond ONLY with: { "l1_demand_notes": "string" }
+      inputs: [user_query, tpch_params]
+      outputs: [l1_demand_notes]
+
+    # ===== Merge 1 (no DB) =====
+    - id: m1_synth_14b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        Merge1:
+        Combine l1_ops_notes, l1_trade_notes, and l1_demand_notes into a coherent mid-level brief.
+        Output should state the dominant driver (ops / trade / demand) and a hypothesis to test next.
+        Respond ONLY with: { "m1_brief": "string" }
+      inputs: [user_query, tpch_params, l1_ops_notes, l1_trade_notes, l1_demand_notes]
+      outputs: [m1_brief]
+
+    # =========================
+    # Layer 2: parallel diagnostics (2-way)
+    # =========================
+
+    - id: l2_shipping_q12q21_20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      db_queries:
+        - name: tpch_q12_shipmode_priority
+          sql: >
+            SELECT l.l_shipmode,
+                   SUM(CASE WHEN o.o_orderpriority IN ('1-URGENT','2-HIGH') THEN 1 ELSE 0 END) AS high_line_count,
+                   SUM(CASE WHEN o.o_orderpriority NOT IN ('1-URGENT','2-HIGH') THEN 1 ELSE 0 END) AS low_line_count
+            FROM orders o
+            JOIN lineitem l ON l.l_orderkey = o.o_orderkey
+            WHERE l.l_shipmode IN (:shipmode, :shipmode2)
+              AND l.l_commitdate < l.l_receiptdate
+              AND l.l_shipdate < l.l_commitdate
+              AND l.l_receiptdate >= make_date(:year::int, 1, 1)
+              AND l.l_receiptdate <  make_date(:year::int, 1, 1) + INTERVAL '1 year'
+            GROUP BY l.l_shipmode
+            ORDER BY l.l_shipmode;
+          parameters:
+            shipmode: "{{ tpch_params.shipmode }}"
+            shipmode2: "{{ tpch_params.shipmode2 }}"
+            year: "{{ tpch_params.year }}"
+          param_types:
+            shipmode: text
+            shipmode2: text
+            year: int
+        - name: tpch_q21_late_shipments_proxy
+          sql: >
+            SELECT COUNT(*) AS late_line_cnt
+            FROM lineitem l
+            WHERE l.l_receiptdate > l.l_commitdate
+              AND l.l_shipdate >= make_date(:year::int, 1, 1)
+              AND l.l_shipdate <  make_date(:year::int, 1, 1) + INTERVAL '1 year';
+          parameters:
+            year: "{{ tpch_params.year }}"
+          param_types:
+            year: int
+      system_prompt: |
+        Layer2-A (Shipping diagnostics, Q12/Q21-like):
+        Explain shipping-mode priority distribution and late-shipment pressure; relate back to m1_brief.
+        Respond ONLY with: { "l2_ship_notes": "string" }
+      inputs: [user_query, tpch_params, m1_brief]
+      outputs: [l2_ship_notes]
+
+    - id: l2_mix_q16q19q11_20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      db_queries:
+        - name: tpch_q16_parts_brand_type_size
+          sql: >
+            SELECT
+              p.p_brand,
+              p.p_type,
+              p.p_size,
+              COUNT(*) AS part_cnt
+            FROM part p
+            WHERE p.p_brand = :brand
+              AND p.p_type ILIKE '%' || :type || '%'
+              AND p.p_size = :size::int
+            GROUP BY p.p_brand, p.p_type, p.p_size
+            ORDER BY part_cnt DESC;
+          parameters:
+            brand: "{{ tpch_params.brand }}"
+            type: "{{ tpch_params.type }}"
+            size: "{{ tpch_params.size }}"
+          param_types:
+            brand: text
+            type: text
+            size: int
+        - name: tpch_q19_discounted_revenue_proxy
+          sql: >
+            SELECT
+              SUM(l.l_extendedprice * (1 - l.l_discount)) AS disc_revenue
+            FROM lineitem l
+            JOIN part p ON p.p_partkey = l.l_partkey
+            WHERE p.p_brand = :brand
+              AND l.l_discount BETWEEN :discount_lo::numeric AND :discount_hi::numeric
+              AND l.l_quantity < :qty::numeric;
+          parameters:
+            brand: "{{ tpch_params.brand }}"
+            discount_lo: "{{ tpch_params.discount_lo }}"
+            discount_hi: "{{ tpch_params.discount_hi }}"
+            qty: "{{ tpch_params.qty }}"
+          param_types:
+            brand: text
+            discount_lo: numeric
+            discount_hi: numeric
+            qty: numeric
+        - name: tpch_q11_partsupp_value_region_proxy
+          sql: >
+            SELECT
+              SUM(ps.ps_supplycost * ps.ps_availqty) AS total_value
+            FROM partsupp ps
+            JOIN supplier s ON s.s_suppkey = ps.ps_suppkey
+            JOIN nation n ON n.n_nationkey = s.s_nationkey
+            JOIN region r ON r.r_regionkey = n.n_regionkey
+            WHERE r.r_name = :region;
+          parameters:
+            region: "{{ tpch_params.region }}"
+          param_types:
+            region: text
+      system_prompt: |
+        Layer2-B (Product & supply mix, Q16/Q19/Q11-like):
+        Interpret brand/type/size supply signals, discounted revenue proxy, and regional supply value.
+        Respond ONLY with: { "l2_mix_notes": "string" }
+      inputs: [user_query, tpch_params, m1_brief]
+      outputs: [l2_mix_notes]
+
+    # ===== Merge 2 (no DB) =====
+    - id: m2_full_context_20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        Merge2:
+        Fuse l2_ship_notes and l2_mix_notes with m1_brief into a final structured report:
+          (i) key metrics, (ii) likely bottleneck/driver, (iii) 3 parameter refinements,
+          (iv) 3 follow-up TPC-H queries (by Q#) and why.
+        Respond ONLY with: { "hub_full_context": "string" }
+      inputs: [user_query, tpch_params, m1_brief, l2_ship_notes, l2_mix_notes]
+      outputs: [hub_full_context]
+
+    # ===== Final (1 DB) =====
+    - id: tpch_final_answer_20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      db_queries:
+        - name: tpch_q14_promo_revenue
+          sql: >
+            SELECT
+              100.00 * SUM(CASE WHEN p.p_type LIKE 'PROMO%' THEN l.l_extendedprice * (1 - l.l_discount) ELSE 0 END)
+              / SUM(l.l_extendedprice * (1 - l.l_discount)) AS promo_revenue
+            FROM lineitem l
+            JOIN part p ON p.p_partkey = l.l_partkey
+            WHERE l.l_shipdate >= make_date(:year::int, 9, 1)
+              AND l.l_shipdate <  make_date(:year::int, 10, 1);
+          parameters:
+            year: "{{ tpch_params.year }}"
+          param_types:
+            year: int
+      system_prompt: |
+        Final:
+        Use hub_full_context plus the Q14 promo_revenue anchor to produce a concise final_answer.
+        Respond ONLY with: { "final_answer": "string" }
+      inputs: [user_query, tpch_params, hub_full_context]
+      outputs: [final_answer]
+
+  edges:
+    - from: user_input
+      to: rule_param_extractor
+      mapping:
+        user_query: "{{ user_query }}"
+
+    # Layer 1 fan-out
+    - from: rule_param_extractor
+      to: l1_ops_backlog_q4_32b
+      mapping: { user_query: "{{ user_query }}", tpch_params: "{{ tpch_params }}" }
+
+    - from: rule_param_extractor
+      to: l1_tradeflow_q7_20b
+      mapping: { user_query: "{{ user_query }}", tpch_params: "{{ tpch_params }}" }
+
+    - from: rule_param_extractor
+      to: l1_demand_q10q18_20b
+      mapping: { user_query: "{{ user_query }}", tpch_params: "{{ tpch_params }}" }
+
+    # Merge 1
+    - from: l1_ops_backlog_q4_32b
+      to: m1_synth_14b
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+        l1_ops_notes: "{{ l1_ops_notes }}"
+
+    - from: l1_tradeflow_q7_20b
+      to: m1_synth_14b
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+        l1_trade_notes: "{{ l1_trade_notes }}"
+
+    - from: l1_demand_q10q18_20b
+      to: m1_synth_14b
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+        l1_demand_notes: "{{ l1_demand_notes }}"
+
+    # Layer 2 fan-out (from Merge1)
+    - from: m1_synth_14b
+      to: l2_shipping_q12q21_20b
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+        m1_brief: "{{ m1_brief }}"
+
+    - from: m1_synth_14b
+      to: l2_mix_q16q19q11_20b
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+        m1_brief: "{{ m1_brief }}"
+
+    # Merge 2
+    - from: l2_shipping_q12q21_20b
+      to: m2_full_context_20b
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+        m1_brief: "{{ m1_brief }}"
+        l2_ship_notes: "{{ l2_ship_notes }}"
+
+    - from: l2_mix_q16q19q11_20b
+      to: m2_full_context_20b
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+        m1_brief: "{{ m1_brief }}"
+        l2_mix_notes: "{{ l2_mix_notes }}"
+
+    # Final
+    - from: m2_full_context_20b
+      to: tpch_final_answer_20b
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+        hub_full_context: "{{ hub_full_context }}"

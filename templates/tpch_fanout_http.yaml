@@ -1,0 +1,577 @@
+graph:
+  name: tpch_fanout_sqlmix_v2_light_42100_http_q3_partial
+  description: >
+    Two-layer fanout template with 5 nodes in Stage 1.
+    Stage 2 keeps Q5-pack (20B), Q1-pack (32B), narrative (20B), and final merger.
+    Removed Stage 2 14B node (Q3-pack).
+    Replaced the Stage 1 Q3-pack SQL with 2 HTTP stand-ins (sleep-based).
+    DB query counts:
+      - Stage 1: 4 / 0 / 1 / 0 / 0 (42100) + 2 HTTP
+      - Stage 2: 4 / 1 / 0 (+ final merger)
+    All DB queries depend only on tpch_params. HTTP depends on user_query + tpch_params.
+
+  nodes:
+    - id: user_input
+      type: input
+      outputs: [user_query]
+
+    - id: rule_param_extractor
+      type: processor
+      processor: regex_param_extractor
+      config:
+        enums:
+          region: ["AFRICA","AMERICA","ASIA","EUROPE","MIDDLE EAST"]
+          shipmode: ["AIR","AIR REG","RAIL","SHIP","TRUCK","MAIL","FOB"]
+          segment: ["AUTOMOBILE","BUILDING","FURNITURE","HOUSEHOLD","MACHINERY"]
+        regex:
+          year:
+            - "(?i)\\byear\\s*[=:]\\s*(199[2-8])\\b"
+            - "(?i)\\b(199[2-8])\\b"
+          segment:
+            - "(?i)\\bsegment\\s*[=:]\\s*(AUTOMOBILE|BUILDING|FURNITURE|HOUSEHOLD|MACHINERY)\\b"
+            - "(?i)\\b(AUTOMOBILE|BUILDING|FURNITURE|HOUSEHOLD|MACHINERY)\\b"
+          shipmode:
+            - "(?i)\\bshipmode\\s*[=:]\\s*(AIR\\s+REG|AIR|RAIL|SHIP|TRUCK|MAIL|FOB)\\b"
+            - "(?i)\\b(AIR\\s+REG|AIR|RAIL|SHIP|TRUCK|MAIL|FOB)\\b"
+          shipmode2:
+            - "(?i)\\bshipmode2\\s*[=:]\\s*(AIR\\s+REG|AIR|RAIL|SHIP|TRUCK|MAIL|FOB)\\b"
+          brand:
+            - "(?i)\\bbrand\\s*[=:]\\s*(Brand#[0-9]{2})\\b"
+            - "(?i)\\b(Brand#[0-9]{2})\\b"
+          qty:
+            - "(?i)\\bqty\\s*[=:]\\s*([0-9]{1,4})\\b"
+            - "(?i)\\bquantity\\s*[=:]\\s*([0-9]{1,4})\\b"
+          discount_lo:
+            - "(?i)\\bdiscount_lo\\s*[=:]\\s*([0-9]*\\.?[0-9]+)\\b"
+          discount_hi:
+            - "(?i)\\bdiscount_hi\\s*[=:]\\s*([0-9]*\\.?[0-9]+)\\b"
+        defaults:
+          year: 1994
+          region: "ASIA"
+          segment: "BUILDING"
+          shipmode: "MAIL"
+          shipmode2: "SHIP"
+          brand: "Brand#13"
+          qty: 24
+          discount_lo: 0.05
+          discount_hi: 0.07
+        normalize:
+          uppercase_fields: ["region","segment","shipmode","shipmode2","brand"]
+          numeric_fields: ["year","qty","discount_lo","discount_hi"]
+          strip_quotes: true
+      inputs: [user_query]
+      outputs: [tpch_params]
+
+    # =========================================================
+    # Stage 1: fanout (4 / 2 / 1 / 0 / 0)
+    # =========================================================
+    - id: stage1_econ_rollup_q5
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B   # swapped (was openai/gpt-oss-20b)
+      system_prompt: |
+        You are a TPC-H analyst agent (Stage 1 / Q5-pack).
+
+        Inputs:
+        - user_query
+        - tpch_params
+        - results of EXACTLY FOUR DB queries
+
+        Do:
+        - For each query, extract 2 key numeric facts (leaders/totals/shares).
+        - Provide 1 cross-query connection.
+        - Provide 1 warning about interpretation risk (skew, sparsity, time window).
+
+        Output JSON only:
+        {
+          "s1_q5_brief": "one dense paragraph",
+          "per_query_facts": [{"query":"string","facts":["string","string"]}],
+          "cross_link": "string",
+          "risk": "string"
+        }
+      inputs: [user_query, tpch_params]
+      outputs: [s1_q5_brief]
+      db_queries:
+        - name: s1_q5_nation_revenue_light_v3
+          sql: >
+            SELECT
+              n.n_name AS nation,
+              SUM(l.l_extendedprice * (1 - l.l_discount)) AS revenue
+            FROM orders o
+            JOIN customer c  ON c.c_custkey = o.o_custkey
+            JOIN nation n    ON n.n_nationkey = c.c_nationkey
+            JOIN lineitem l  ON l.l_orderkey = o.o_orderkey
+            WHERE c.c_mktsegment = :segment
+              AND o.o_orderdate >= make_date(:year::int, 1, 1)
+              AND o.o_orderdate <  make_date(:year::int, 1, 1) + INTERVAL '1 year'
+            GROUP BY n.n_name
+            ORDER BY revenue DESC, nation
+            LIMIT 12;
+          parameters:
+            year: "{{ tpch_params.year }}"
+            segment: "{{ tpch_params.segment }}"
+          param_types:
+            year: int
+            segment: str
+
+        - name: s1_q5_brand_volume_share_light_v3
+          sql: >
+            SELECT
+              EXTRACT(YEAR FROM o.o_orderdate)::int AS o_year,
+              SUM(l.l_extendedprice * (1 - l.l_discount)) AS total_volume,
+              SUM(CASE WHEN p.p_brand = :brand
+                       THEN l.l_extendedprice * (1 - l.l_discount) ELSE 0 END) AS brand_volume
+            FROM orders o
+            JOIN lineitem l ON l.l_orderkey = o.o_orderkey
+            JOIN part p     ON p.p_partkey = l.l_partkey
+            WHERE o.o_orderdate >= make_date(:year::int, 1, 1)
+              AND o.o_orderdate <  make_date(:year::int, 1, 1) + INTERVAL '1 year'
+            GROUP BY o_year
+            ORDER BY o_year;
+          parameters:
+            year: "{{ tpch_params.year }}"
+            brand: "{{ tpch_params.brand }}"
+          param_types:
+            year: int
+            brand: str
+
+        - name: s1_q5_return_revenue_by_nation_light_v3
+          sql: >
+            SELECT
+              n.n_name AS nation,
+              SUM(l.l_extendedprice * (1 - l.l_discount)) AS revenue,
+              COUNT(*) AS line_cnt
+            FROM customer c
+            JOIN nation n   ON n.n_nationkey = c.c_nationkey
+            JOIN orders o   ON o.o_custkey = c.c_custkey
+            JOIN lineitem l ON l.l_orderkey = o.o_orderkey
+            WHERE c.c_mktsegment = :segment
+              AND o.o_orderdate >= make_date(:year::int, 1, 1)
+              AND o.o_orderdate <  make_date(:year::int, 1, 1) + INTERVAL '1 year'
+              AND l.l_returnflag = 'R'
+            GROUP BY n.n_name
+            ORDER BY revenue DESC, nation
+            LIMIT 12;
+          parameters:
+            year: "{{ tpch_params.year }}"
+            segment: "{{ tpch_params.segment }}"
+          param_types:
+            year: int
+            segment: str
+
+        - name: s1_q5_brand_inventory_by_supplier_nation_light_v3
+          sql: >
+            SELECT
+              n.n_name AS nation,
+              SUM(ps.ps_supplycost * ps.ps_availqty) AS inv_cost,
+              COUNT(DISTINCT s.s_suppkey) AS supplier_cnt
+            FROM part p
+            JOIN partsupp ps ON ps.ps_partkey = p.p_partkey
+            JOIN supplier s  ON s.s_suppkey = ps.ps_suppkey
+            JOIN nation n    ON n.n_nationkey = s.s_nationkey
+            WHERE p.p_brand = :brand
+            GROUP BY n.n_name
+            ORDER BY inv_cost DESC, nation
+            LIMIT 12;
+          parameters:
+            brand: "{{ tpch_params.brand }}"
+          param_types:
+            brand: str
+
+    # =========================================================
+    # Stage 1: HTTP stand-ins for Q3-pack
+    # =========================================================
+    - id: http_s1_q3_q3_segment_revenue
+      type: http
+      engine: http
+      sleep_s: 2
+      inputs: [user_query, tpch_params]
+      outputs: [http_s1_q3_q3_segment_revenue]
+
+    - id: http_s1_q3_q12_shipmode_priority
+      type: http
+      engine: http
+      sleep_s: 2
+      inputs: [user_query, tpch_params]
+      outputs: [http_s1_q3_q12_shipmode_priority]
+
+    - id: stage1_seg_ship_q3
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        You are a TPC-H reasoning agent (Stage 1 / Q3-pack).
+
+        You will receive EXACTLY TWO API payloads:
+        - http_s1_q3_q3_segment_revenue
+        - http_s1_q3_q12_shipmode_priority
+
+        Requirements:
+        - Use numbers: cite totals and at least one breakdown item.
+        - Provide 2 insights and 2 sanity checks.
+
+        Output JSON only:
+        {
+          "s1_q3_brief": "one dense paragraph",
+          "insights": ["string","string"],
+          "sanity": ["string","string"]
+        }
+      inputs:
+        - user_query
+        - tpch_params
+        - http_s1_q3_q3_segment_revenue
+        - http_s1_q3_q12_shipmode_priority
+      outputs: [s1_q3_brief]
+
+    - id: stage1_disc_band_q1
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b  # swapped (was Qwen/Qwen3-32B)
+      system_prompt: |
+        Numeric summarizer (Stage 1 / Q1-pack).
+
+        Interpret the discount-band revenue query:
+        - explain what it measures
+        - extract key metrics (total, count, avg_discount)
+        - provide one interpretation linked to tpch_params
+
+        Output JSON only:
+        {
+          "s1_q1_brief": "one paragraph",
+          "metrics": {"total_price":"number or null","line_cnt":"int or null","avg_discount":"number or null"},
+          "interpretation": "string"
+        }
+      inputs: [user_query, tpch_params]
+      outputs: [s1_q1_brief]
+      db_queries:
+        - name: s1_q1_discounted_revenue
+          sql: >
+            SELECT
+              SUM(l.l_extendedprice * l.l_discount) AS total_price,
+              COUNT(*) AS line_cnt,
+              AVG(l.l_discount) AS avg_discount
+            FROM lineitem l
+            WHERE l.l_shipdate >= make_date(:year::int, 1, 1)
+              AND l.l_shipdate <  make_date(:year::int, 1, 1) + INTERVAL '1 year'
+              AND l.l_discount BETWEEN :discount_lo AND :discount_hi
+              AND l.l_quantity < :qty
+              AND l.l_returnflag IN ('R','A');
+          parameters:
+            year: "{{ tpch_params.year }}"
+            qty: "{{ tpch_params.qty }}"
+            discount_lo: "{{ tpch_params.discount_lo }}"
+            discount_hi: "{{ tpch_params.discount_hi }}"
+          param_types:
+            year: int
+            qty: int
+            discount_lo: float
+            discount_hi: float
+
+    - id: stage1_hypothesis_q0a
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B   # swapped (was openai/gpt-oss-20b)
+      system_prompt: |
+        Stage 1 quick planner (no DB queries).
+
+        Using user_query + tpch_params:
+        - propose 2 hypotheses
+        - propose 2 checks to validate DB results
+
+        Output JSON only:
+        { "s1_q0a_brief": "string", "hypotheses": ["string","string"], "checks": ["string","string"] }
+      inputs: [user_query, tpch_params]
+      outputs: [s1_q0a_brief]
+
+    - id: stage1_altangle_q0b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B   # swapped (was openai/gpt-oss-20b)
+      system_prompt: |
+        Stage 1 alternative angle (no DB queries).
+
+        Provide:
+        - 2 alternative explanations that might mislead aggregates
+        - 2 questions for stage 2
+
+        Output JSON only:
+        { "s1_q0b_brief": "string", "alt_explanations": ["string","string"], "questions": ["string","string"] }
+      inputs: [user_query, tpch_params]
+      outputs: [s1_q0b_brief]
+
+    # =========================================================
+    # Stage 2: q5 (20B) + q1 (32B) + narrative (20B) + final merger
+    # (no Stage2 14B node)
+    # =========================================================
+    - id: stage2_econ_rollup_q5
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B   # swapped (was openai/gpt-oss-20b)
+      system_prompt: |
+        You are a TPC-H analyst agent (Stage 2 / Q5-pack).
+
+        Inputs:
+        - user_query, tpch_params
+        - stage1 briefs: s1_q5_brief, s1_q3_brief, s1_q1_brief, s1_q0a_brief, s1_q0b_brief
+        - results of EXACTLY FOUR DB queries
+
+        Tasks:
+        - Validate at least 1 stage1 hypothesis/check using concrete numbers.
+        - Provide 2 delta-aware statements (consistent vs uncertain).
+        - Produce a compact brief.
+
+        Output JSON only:
+        { "s2_q5_brief": "one dense paragraph", "deltas": ["string","string"] }
+      inputs: [user_query, tpch_params, s1_q5_brief, s1_q3_brief, s1_q1_brief, s1_q0a_brief, s1_q0b_brief]
+      outputs: [s2_q5_brief]
+      db_queries:
+        - name: s2_q5_nation_revenue_light_v3
+          sql: >
+            SELECT
+              n.n_name AS nation,
+              SUM(l.l_extendedprice * (1 - l.l_discount)) AS revenue
+            FROM orders o
+            JOIN customer c  ON c.c_custkey = o.o_custkey
+            JOIN nation n    ON n.n_nationkey = c.c_nationkey
+            JOIN lineitem l  ON l.l_orderkey = o.o_orderkey
+            WHERE c.c_mktsegment = :segment
+              AND o.o_orderdate >= make_date(:year::int, 1, 1)
+              AND o.o_orderdate <  make_date(:year::int, 1, 1) + INTERVAL '1 year'
+            GROUP BY n.n_name
+            ORDER BY revenue DESC, nation
+            LIMIT 12;
+          parameters:
+            year: "{{ tpch_params.year }}"
+            segment: "{{ tpch_params.segment }}"
+          param_types:
+            year: int
+            segment: str
+
+        - name: s2_q5_brand_volume_share_light_v3
+          sql: >
+            SELECT
+              EXTRACT(YEAR FROM o.o_orderdate)::int AS o_year,
+              SUM(l.l_extendedprice * (1 - l.l_discount)) AS total_volume,
+              SUM(CASE WHEN p.p_brand = :brand
+                       THEN l.l_extendedprice * (1 - l.l_discount) ELSE 0 END) AS brand_volume
+            FROM orders o
+            JOIN lineitem l ON l.l_orderkey = o.o_orderkey
+            JOIN part p     ON p.p_partkey = l.l_partkey
+            WHERE o.o_orderdate >= make_date(:year::int, 1, 1)
+              AND o.o_orderdate <  make_date(:year::int, 1, 1) + INTERVAL '1 year'
+            GROUP BY o_year
+            ORDER BY o_year;
+          parameters:
+            year: "{{ tpch_params.year }}"
+            brand: "{{ tpch_params.brand }}"
+          param_types:
+            year: int
+            brand: str
+
+        - name: s2_q5_return_revenue_by_nation_light_v3
+          sql: >
+            SELECT
+              n.n_name AS nation,
+              SUM(l.l_extendedprice * (1 - l.l_discount)) AS revenue,
+              COUNT(*) AS line_cnt
+            FROM customer c
+            JOIN nation n   ON n.n_nationkey = c.c_nationkey
+            JOIN orders o   ON o.o_custkey = c.c_custkey
+            JOIN lineitem l ON l.l_orderkey = o.o_orderkey
+            WHERE c.c_mktsegment = :segment
+              AND o.o_orderdate >= make_date(:year::int, 1, 1)
+              AND o.o_orderdate <  make_date(:year::int, 1, 1) + INTERVAL '1 year'
+              AND l.l_returnflag = 'R'
+            GROUP BY n.n_name
+            ORDER BY revenue DESC, nation
+            LIMIT 12;
+          parameters:
+            year: "{{ tpch_params.year }}"
+            segment: "{{ tpch_params.segment }}"
+          param_types:
+            year: int
+            segment: str
+
+        - name: s2_q5_brand_inventory_by_supplier_nation_light_v3
+          sql: >
+            SELECT
+              n.n_name AS nation,
+              SUM(ps.ps_supplycost * ps.ps_availqty) AS inv_cost,
+              COUNT(DISTINCT s.s_suppkey) AS supplier_cnt
+            FROM part p
+            JOIN partsupp ps ON ps.ps_partkey = p.p_partkey
+            JOIN supplier s  ON s.s_suppkey = ps.ps_suppkey
+            JOIN nation n    ON n.n_nationkey = s.s_nationkey
+            WHERE p.p_brand = :brand
+            GROUP BY n.n_name
+            ORDER BY inv_cost DESC, nation
+            LIMIT 12;
+          parameters:
+            brand: "{{ tpch_params.brand }}"
+          param_types:
+            brand: str
+
+    - id: stage2_disc_band_q1
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b  # swapped (was Qwen/Qwen3-32B)
+      system_prompt: |
+        Stage 2 numeric summarizer (Q1-pack).
+
+        Use stage1 briefs to contextualize the discount-band revenue:
+        - Does it align with other patterns?
+        - Note 1 caveat.
+
+        Output JSON only:
+        { "s2_q1_brief": "one paragraph", "notes": ["string","string"] }
+      inputs: [user_query, tpch_params, s1_q5_brief, s1_q3_brief, s1_q1_brief, s1_q0a_brief, s1_q0b_brief]
+      outputs: [s2_q1_brief]
+      db_queries:
+        - name: s2_q1_discounted_revenue
+          sql: >
+            SELECT
+              SUM(l.l_extendedprice * l.l_discount) AS total_price,
+              COUNT(*) AS line_cnt,
+              AVG(l.l_discount) AS avg_discount
+            FROM lineitem l
+            WHERE l.l_shipdate >= make_date(:year::int, 1, 1)
+              AND l.l_shipdate <  make_date(:year::int, 1, 1) + INTERVAL '1 year'
+              AND l.l_discount BETWEEN :discount_lo AND :discount_hi
+              AND l.l_quantity < :qty
+              AND l.l_returnflag IN ('R','A');
+          parameters:
+            year: "{{ tpch_params.year }}"
+            qty: "{{ tpch_params.qty }}"
+            discount_lo: "{{ tpch_params.discount_lo }}"
+            discount_hi: "{{ tpch_params.discount_hi }}"
+          param_types:
+            year: int
+            qty: int
+            discount_lo: float
+            discount_hi: float
+
+    - id: stage2_narrative_q0a
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B   # swapped (was openai/gpt-oss-20b)
+      system_prompt: |
+        Stage 2 narrative synthesizer (no DB queries).
+
+        Provide:
+        - 2 candidate narratives
+        - 2 caveats
+
+        Output JSON only:
+        { "s2_q0a_brief": "string", "narratives": ["string","string"], "caveats": ["string","string"] }
+      inputs: [user_query, tpch_params, s1_q5_brief, s1_q3_brief, s1_q1_brief, s1_q0a_brief, s1_q0b_brief]
+      outputs: [s2_q0a_brief]
+
+    - id: stage2_final_merge
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B   # swapped (was openai/gpt-oss-20b)
+      system_prompt: |
+        Final merger.
+
+        Inputs: s2_q5_brief, s2_q1_brief, s2_q0a_brief
+        Write a coherent final answer that:
+        - includes at least 3 concrete numeric facts or ranked statements
+        - includes 1 caveat
+        - ends with 2 follow-up questions
+
+        Output JSON only:
+        { "final_answer": "string" }
+      inputs: [s2_q5_brief, s2_q1_brief, s2_q0a_brief]
+      outputs: [final_answer]
+
+  edges:
+    - from: user_input
+      to: rule_param_extractor
+      mapping: { user_query: "{{ user_query }}" }
+
+    - from: rule_param_extractor
+      to: stage1_econ_rollup_q5
+      mapping: { user_query: "{{ user_query }}", tpch_params: "{{ tpch_params }}" }
+    - from: rule_param_extractor
+      to: stage1_seg_ship_q3
+      mapping: { user_query: "{{ user_query }}", tpch_params: "{{ tpch_params }}" }
+    - from: rule_param_extractor
+      to: http_s1_q3_q3_segment_revenue
+      mapping: { user_query: "{{ user_query }}", tpch_params: "{{ tpch_params }}" }
+    - from: rule_param_extractor
+      to: http_s1_q3_q12_shipmode_priority
+      mapping: { user_query: "{{ user_query }}", tpch_params: "{{ tpch_params }}" }
+    - from: rule_param_extractor
+      to: stage1_disc_band_q1
+      mapping: { user_query: "{{ user_query }}", tpch_params: "{{ tpch_params }}" }
+    - from: rule_param_extractor
+      to: stage1_hypothesis_q0a
+      mapping: { user_query: "{{ user_query }}", tpch_params: "{{ tpch_params }}" }
+    - from: rule_param_extractor
+      to: stage1_altangle_q0b
+      mapping: { user_query: "{{ user_query }}", tpch_params: "{{ tpch_params }}" }
+
+    - from: http_s1_q3_q3_segment_revenue
+      to: stage1_seg_ship_q3
+      mapping: { http_s1_q3_q3_segment_revenue: "{{ http_s1_q3_q3_segment_revenue }}" }
+    - from: http_s1_q3_q12_shipmode_priority
+      to: stage1_seg_ship_q3
+      mapping: { http_s1_q3_q12_shipmode_priority: "{{ http_s1_q3_q12_shipmode_priority }}" }
+
+    - from: stage1_econ_rollup_q5
+      to: stage2_econ_rollup_q5
+      mapping: { s1_q5_brief: "{{ s1_q5_brief }}" }
+    - from: stage1_seg_ship_q3
+      to: stage2_econ_rollup_q5
+      mapping: { s1_q3_brief: "{{ s1_q3_brief }}" }
+    - from: stage1_disc_band_q1
+      to: stage2_econ_rollup_q5
+      mapping: { s1_q1_brief: "{{ s1_q1_brief }}" }
+    - from: stage1_hypothesis_q0a
+      to: stage2_econ_rollup_q5
+      mapping: { s1_q0a_brief: "{{ s1_q0a_brief }}" }
+    - from: stage1_altangle_q0b
+      to: stage2_econ_rollup_q5
+      mapping: { s1_q0b_brief: "{{ s1_q0b_brief }}" }
+
+    - from: stage1_econ_rollup_q5
+      to: stage2_disc_band_q1
+      mapping: { s1_q5_brief: "{{ s1_q5_brief }}" }
+    - from: stage1_seg_ship_q3
+      to: stage2_disc_band_q1
+      mapping: { s1_q3_brief: "{{ s1_q3_brief }}" }
+    - from: stage1_disc_band_q1
+      to: stage2_disc_band_q1
+      mapping: { s1_q1_brief: "{{ s1_q1_brief }}" }
+    - from: stage1_hypothesis_q0a
+      to: stage2_disc_band_q1
+      mapping: { s1_q0a_brief: "{{ s1_q0a_brief }}" }
+    - from: stage1_altangle_q0b
+      to: stage2_disc_band_q1
+      mapping: { s1_q0b_brief: "{{ s1_q0b_brief }}" }
+
+    - from: stage1_econ_rollup_q5
+      to: stage2_narrative_q0a
+      mapping: { s1_q5_brief: "{{ s1_q5_brief }}" }
+    - from: stage1_seg_ship_q3
+      to: stage2_narrative_q0a
+      mapping: { s1_q3_brief: "{{ s1_q3_brief }}" }
+    - from: stage1_disc_band_q1
+      to: stage2_narrative_q0a
+      mapping: { s1_q1_brief: "{{ s1_q1_brief }}" }
+    - from: stage1_hypothesis_q0a
+      to: stage2_narrative_q0a
+      mapping: { s1_q0a_brief: "{{ s1_q0a_brief }}" }
+    - from: stage1_altangle_q0b
+      to: stage2_narrative_q0a
+      mapping: { s1_q0b_brief: "{{ s1_q0b_brief }}" }
+
+    - from: stage2_econ_rollup_q5
+      to: stage2_final_merge
+      mapping: { s2_q5_brief: "{{ s2_q5_brief }}" }
+    - from: stage2_disc_band_q1
+      to: stage2_final_merge
+      mapping: { s2_q1_brief: "{{ s2_q1_brief }}" }
+    - from: stage2_narrative_q0a
+      to: stage2_final_merge
+      mapping: { s2_q0a_brief: "{{ s2_q0a_brief }}" }

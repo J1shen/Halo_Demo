@@ -1,0 +1,348 @@
+graph:
+  name: imdb_qa_agent_triple_chain_10nodes_3models_32b_http
+  description: >
+    Triple-chain IMDb workflow with a keyword planner root.
+    10 LLM nodes in total (excluding user_input). Each chain has exactly
+    one DB query (movies/people/crew), and all queries depend only on
+    search_keyword. The final head no longer issues DB queries.
+    Uses exactly three models: Qwen3-32B, Qwen3-14B, and openai/gpt-oss-20b.
+    Model types are arranged so that different epoch groupings can either
+    reuse the same model or incur extra switches depending on ordering.
+    HTTP stand-ins replace the DB queries for chain entry retrieval.
+
+  nodes:
+    - id: user_input
+      type: input
+      outputs:
+        - user_query
+
+    # ===== root: keyword planner (openai/gpt-oss-20b, LLM-only) =====
+    - id: keyword_planner
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        You are a keyword planning assistant for an IMDb-like database.
+        Given user_query, produce a concise search_keyword suitable for ILIKE
+        on titles, names, and related text fields.
+        Respond ONLY with:
+        {
+          "search_keyword": "string"
+        }
+      inputs:
+        - user_query
+      outputs:
+        - search_keyword
+
+    # ===== HTTP stand-ins for chain entry queries =====
+    - id: http_imdb_movie_overview_main
+      type: http
+      engine: http
+      sleep_s: 2
+      inputs:
+        - search_keyword
+      outputs:
+        - http_imdb_movie_overview_main
+
+    - id: http_imdb_people_overview_main
+      type: http
+      engine: http
+      sleep_s: 2
+      inputs:
+        - search_keyword
+      outputs:
+        - http_imdb_people_overview_main
+
+    - id: http_imdb_crew_by_title_keyword
+      type: http
+      engine: http
+      sleep_s: 2
+      inputs:
+        - search_keyword
+      outputs:
+        - http_imdb_crew_by_title_keyword
+
+    # ===== movie chain (Qwen3-32B, 2 nodes, 1+0 queries) =====
+    - id: movie_overview_qwen32b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+      system_prompt: |
+        Movie chain: overview.
+        Use rows from http_imdb_movie_overview_main to identify candidate titles
+        and describe the overall landscape.
+        Respond ONLY with:
+        {
+          "movie_overview": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+        - http_imdb_movie_overview_main
+      outputs:
+        - movie_overview
+
+    - id: movie_final_notes_qwen32b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+      system_prompt: |
+        Movie chain: final notes.
+        Based on movie_overview, highlight 3–5 representative titles and
+        explain why they matter for the user_query.
+        Respond ONLY with:
+        {
+          "movie_final_notes": "string"
+        }
+      inputs:
+        - user_query
+        - movie_overview
+      outputs:
+        - movie_final_notes
+
+    # ===== people chain (openai/gpt-oss-20b, 2 nodes, 1+0 queries) =====
+    - id: people_overview_openai20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        People chain: overview.
+        Use http_imdb_people_overview_main to summarize which actors/directors/writers
+        are most relevant to the search_keyword.
+        Respond ONLY with:
+        {
+          "people_overview": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+        - http_imdb_people_overview_main
+      outputs:
+        - people_overview
+
+    - id: people_final_notes_openai20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        People chain: final notes.
+        From people_overview, explain which people are most central to
+        answering the user_query, and why.
+        Respond ONLY with:
+        {
+          "people_final_notes": "string"
+        }
+      inputs:
+        - user_query
+        - people_overview
+      outputs:
+        - people_final_notes
+
+    # ===== crew chain (Qwen3-14B, 3 nodes, 1+0+0 queries) =====
+    - id: crew_overview_qwen14b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        Crew chain: overview.
+        Use http_imdb_crew_by_title_keyword to summarize typical directors/writers
+        and crew patterns relevant to the search_keyword.
+        Respond ONLY with:
+        {
+          "crew_overview": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+        - http_imdb_crew_by_title_keyword
+      outputs:
+        - crew_overview
+
+    - id: crew_insights_qwen14b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        Crew chain: mid-level insights.
+        Turn crew_overview into a few concrete, human-readable insights
+        about directing/writing styles that matter for the user_query.
+        Respond ONLY with:
+        {
+          "crew_insights": "string"
+        }
+      inputs:
+        - user_query
+        - crew_overview
+      outputs:
+        - crew_insights
+
+    - id: crew_final_notes_qwen14b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        Crew chain: final notes.
+        Produce crew-centric final notes that downstream nodes can
+        consume, focusing on how directors/writers shape interpretation
+        of the titles.
+        Respond ONLY with:
+        {
+          "crew_final_notes": "string"
+        }
+      inputs:
+        - user_query
+        - crew_insights
+      outputs:
+        - crew_final_notes
+
+    # ===== small sanity + final merge head =====
+    - id: small_sanity_check_qwen32b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+      system_prompt: |
+        You are a lightweight sanity checker.
+        Rewrite user_query into a shorter, unambiguous canonical_query.
+        Respond ONLY with:
+        {
+          "canonical_query": "string"
+        }
+      inputs:
+        - user_query
+      outputs:
+        - canonical_query
+
+    - id: final_answer_qwen14b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        Final answer assistant.
+        Combine movie_final_notes, people_final_notes, crew_final_notes,
+        and canonical_query into a single clear, grounded answer.
+        Respond ONLY with:
+        {
+          "final_answer": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+        - canonical_query
+        - movie_final_notes
+        - people_final_notes
+        - crew_final_notes
+      outputs:
+        - final_answer
+
+  edges:
+    - from: user_input
+      to: keyword_planner
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: user_input
+      to: small_sanity_check_qwen32b
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: keyword_planner
+      to: movie_overview_qwen32b
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+
+    - from: keyword_planner
+      to: http_imdb_movie_overview_main
+      mapping:
+        search_keyword: "{{ search_keyword }}"
+
+    - from: keyword_planner
+      to: people_overview_openai20b
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+
+    - from: keyword_planner
+      to: http_imdb_people_overview_main
+      mapping:
+        search_keyword: "{{ search_keyword }}"
+
+    - from: keyword_planner
+      to: crew_overview_qwen14b
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+
+    - from: keyword_planner
+      to: http_imdb_crew_by_title_keyword
+      mapping:
+        search_keyword: "{{ search_keyword }}"
+
+    - from: keyword_planner
+      to: final_answer_qwen14b
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+
+    - from: movie_overview_qwen32b
+      to: movie_final_notes_qwen32b
+      mapping:
+        user_query: "{{ user_query }}"
+        movie_overview: "{{ movie_overview }}"
+
+    - from: http_imdb_movie_overview_main
+      to: movie_overview_qwen32b
+      mapping:
+        http_imdb_movie_overview_main: "{{ http_imdb_movie_overview_main }}"
+
+    - from: people_overview_openai20b
+      to: people_final_notes_openai20b
+      mapping:
+        user_query: "{{ user_query }}"
+        people_overview: "{{ people_overview }}"
+
+    - from: http_imdb_people_overview_main
+      to: people_overview_openai20b
+      mapping:
+        http_imdb_people_overview_main: "{{ http_imdb_people_overview_main }}"
+
+    - from: crew_overview_qwen14b
+      to: crew_insights_qwen14b
+      mapping:
+        user_query: "{{ user_query }}"
+        crew_overview: "{{ crew_overview }}"
+
+    - from: http_imdb_crew_by_title_keyword
+      to: crew_overview_qwen14b
+      mapping:
+        http_imdb_crew_by_title_keyword: "{{ http_imdb_crew_by_title_keyword }}"
+
+    - from: crew_insights_qwen14b
+      to: crew_final_notes_qwen14b
+      mapping:
+        user_query: "{{ user_query }}"
+        crew_insights: "{{ crew_insights }}"
+
+    - from: small_sanity_check_qwen32b
+      to: final_answer_qwen14b
+      mapping:
+        user_query: "{{ user_query }}"
+        canonical_query: "{{ canonical_query }}"
+
+    - from: movie_final_notes_qwen32b
+      to: final_answer_qwen14b
+      mapping:
+        user_query: "{{ user_query }}"
+        movie_final_notes: "{{ movie_final_notes }}"
+
+    - from: people_final_notes_openai20b
+      to: final_answer_qwen14b
+      mapping:
+        user_query: "{{ user_query }}"
+        people_final_notes: "{{ people_final_notes }}"
+
+    - from: crew_final_notes_qwen14b
+      to: final_answer_qwen14b
+      mapping:
+        user_query: "{{ user_query }}"
+        crew_final_notes: "{{ crew_final_notes }}"

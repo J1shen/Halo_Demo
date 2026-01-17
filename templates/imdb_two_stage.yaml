@@ -1,0 +1,356 @@
+graph:
+  name: imdb_qa_agent_2stage
+  description: >
+    A 2-stage QA workflow over a local IMDb-style DB.
+    Stage 1 retrieves candidate movies and people.
+    Stage 2 fetches richer join-based context and produces a grounded answer.
+
+  nodes:
+    - id: user_input
+      type: input
+      outputs:
+        - user_query
+
+    - id: keyword_extractor
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        You are a keyword extraction assistant. Given a user query about movies or people,
+        produce a concise list of the most important search keywords (titles, names, genres,
+        years, etc.) that can be fed into SQL ILIKE filters.
+
+        Respond ONLY with a single valid JSON object, with no extra text, no comments,
+        and no markdown code fences:
+        {
+          "search_keyword": "keyword1, keyword2"
+        }
+
+        Requirements:
+        - Do NOT add any other keys.
+        - Do NOT include explanations or natural language before or after the JSON.
+        - The value of "search_keyword" should be a short comma-separated string.
+      inputs:
+        - user_query
+      outputs:
+        - search_keyword
+
+    # ===== Stage 1: 初步检索 + summary（电影 + 人物） =====
+    - id: stage1_imdb_retrieval
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+
+      db_queries:
+        # 1) 按标题 + 类型 + 评分搜索电影，并计算一个简单的热度得分，给后续 LLM 排序参考
+        - name: search_movies_by_title
+          sql: >
+            WITH ranked_movies AS (
+              SELECT
+                b.tconst,
+                b.primary_title,
+                b.original_title,
+                b.title_type,
+                b.start_year,
+                b.end_year,
+                b.runtime_minutes,
+                b.genres,
+                r.average_rating,
+                r.num_votes,
+                -- 一个简单的“热度”特征，便于 LLM 利用
+                COALESCE(r.average_rating, 0) * LN(1 + COALESCE(r.num_votes, 0)) AS popularity_score
+              FROM title_basics AS b
+              LEFT JOIN title_ratings AS r
+                ON r.tconst = b.tconst
+              WHERE b.title_type IN ('movie', 'tvMovie', 'tvSeries')
+                AND (
+                  b.primary_title ILIKE '%%' || :keyword || '%%'
+                  OR b.original_title ILIKE '%%' || :keyword || '%%'
+                )
+            )
+            SELECT *
+            FROM ranked_movies
+            ORDER BY
+              popularity_score DESC,
+              start_year DESC
+            LIMIT 60;
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+
+        # 2) 按人物姓名 + known_for_titles 展开成电影，并预聚合成 JSON，方便后续复用
+        - name: search_people_and_known_for
+          sql: >
+            WITH kf AS (
+              SELECT
+                n.nconst,
+                n.primary_name,
+                n.primary_profession,
+                n.known_for_titles,
+                regexp_split_to_table(n.known_for_titles, ',') AS kf_tconst
+              FROM name_basics AS n
+              WHERE n.primary_name ILIKE '%%' || :keyword || '%%'
+            ),
+            kf_expanded AS (
+              SELECT
+                kf.nconst,
+                kf.primary_name,
+                kf.primary_profession,
+                kf.known_for_titles,
+                b.tconst        AS known_for_tconst,
+                b.primary_title AS known_for_title,
+                b.start_year    AS known_for_year,
+                r.average_rating AS known_for_rating,
+                r.num_votes     AS known_for_votes
+              FROM kf
+              LEFT JOIN title_basics AS b
+                ON b.tconst = kf.kf_tconst
+              LEFT JOIN title_ratings AS r
+                ON r.tconst = b.tconst
+            )
+            SELECT
+              nconst,
+              primary_name,
+              primary_profession,
+              known_for_titles,
+              json_agg(
+                json_build_object(
+                  'tconst', known_for_tconst,
+                  'title',  known_for_title,
+                  'year',   known_for_year,
+                  'rating', known_for_rating,
+                  'votes',  known_for_votes
+                )
+                ORDER BY COALESCE(known_for_votes, 0) DESC,
+                         COALESCE(known_for_rating, 0) DESC
+              ) AS known_for_movies
+            FROM kf_expanded
+            GROUP BY
+              nconst,
+              primary_name,
+              primary_profession,
+              known_for_titles
+            ORDER BY
+              primary_name
+            LIMIT 80;
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+
+      system_prompt: |
+        You are an IMDb retrieval and summarization assistant.
+
+        You receive result sets from two SQL queries:
+        (1) movie-level results with ratings and a popularity_score,
+        (2) people-level results with their "known for" titles aggregated as JSON.
+
+        Tasks:
+        1. Merge and deduplicate candidate movies (by tconst) and people (by nconst).
+        2. Select 5–20 of the most relevant movies and 3–10 of the most relevant people,
+           based on the user query, popularity_score, rating, and vote count.
+        3. Produce a concise COARSE SUMMARY that describes what the user likely wants
+           (e.g., specific movie, director, actor, co-appearance, filmography, etc.).
+
+        Respond ONLY with a single valid JSON object, with no extra text, no comments,
+        and no markdown code fences:
+        {
+          "coarse_summary": "string",
+          "candidate_movie_tconsts": ["tt1234567", "tt7654321"],
+          "candidate_person_nconsts": ["nm0000123", "nm9999999"]
+        }
+
+        Requirements:
+        - Do NOT add any other keys.
+        - The arrays may be empty if nothing is relevant, but must still be present.
+        - All IDs must come from the SQL result sets; do NOT invent IDs.
+      inputs:
+        - user_query
+        - search_keyword
+      outputs:
+        - coarse_summary
+        - candidate_movie_tconsts
+        - candidate_person_nconsts
+
+    # ===== Stage 2: 深度 join 检索 + 最终回答 =====
+    - id: stage2_imdb_answer
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+
+      db_queries:
+        # 1) 按 Stage 1 给出的 tconst 列表，获取电影 + 评分 + 主要 cast/crew（多表 join + json_agg）
+        #    这里用数组参数 movie_ids，便于跨请求合并、提升 DB cache reuse。
+        - name: movie_cast_and_crew
+          sql: >
+            SELECT
+              b.tconst,
+              b.primary_title,
+              b.original_title,
+              b.title_type,
+              b.start_year,
+              b.end_year,
+              b.runtime_minutes,
+              b.genres,
+              r.average_rating,
+              r.num_votes,
+              c.directors,
+              c.writers,
+              json_agg(
+                json_build_object(
+                  'nconst',     p.nconst,
+                  'name',       n.primary_name,
+                  'category',   p.category,
+                  'job',        p.job,
+                  'characters', p.characters
+                )
+                ORDER BY p.ordering
+              ) AS top_people
+            FROM title_basics AS b
+            LEFT JOIN title_ratings AS r
+              ON r.tconst = b.tconst
+            LEFT JOIN title_crew AS c
+              ON c.tconst = b.tconst
+            LEFT JOIN title_principals AS p
+              ON p.tconst = b.tconst
+            LEFT JOIN name_basics AS n
+              ON n.nconst = p.nconst
+            WHERE b.tconst = ANY(:movie_ids)
+            GROUP BY
+              b.tconst,
+              b.primary_title,
+              b.original_title,
+              b.title_type,
+              b.start_year,
+              b.end_year,
+              b.runtime_minutes,
+              b.genres,
+              r.average_rating,
+              r.num_votes,
+              c.directors,
+              c.writers
+            ORDER BY
+              COALESCE(r.num_votes, 0) DESC,
+              COALESCE(r.average_rating, 0) DESC,
+              b.start_year DESC;
+          parameters:
+            movie_ids: "{{ candidate_movie_tconsts }}"
+          param_types:
+            movie_ids: text[]
+
+        # 2) 共演网络：根据 Stage 1 人物列表统计常见合作人，使用 person_ids 数组提高复用。
+        - name: coappearance_stats
+          sql: >
+            WITH target_people AS (
+              SELECT nconst, primary_name
+              FROM name_basics
+              WHERE nconst = ANY(:person_ids)
+            ),
+            target_titles AS (
+              SELECT DISTINCT p.tconst, tp.nconst, tp.primary_name
+              FROM title_principals AS p
+              JOIN target_people AS tp
+                ON tp.nconst = p.nconst
+            ),
+            co_principals AS (
+              SELECT
+                t.tconst,
+                t.nconst        AS target_nconst,
+                t.primary_name  AS target_name,
+                p.nconst        AS co_nconst
+              FROM target_titles AS t
+              JOIN title_principals AS p
+                ON p.tconst = t.tconst
+              WHERE p.nconst <> t.nconst
+            )
+            SELECT
+              cp.target_nconst,
+              cp.target_name,
+              n.primary_name      AS co_name,
+              cp.co_nconst,
+              COUNT(*)            AS collaborations
+            FROM co_principals AS cp
+            JOIN name_basics AS n
+              ON n.nconst = cp.co_nconst
+            GROUP BY
+              cp.target_nconst,
+              cp.target_name,
+              cp.co_nconst,
+              n.primary_name
+            HAVING COUNT(*) >= 2
+            ORDER BY
+              collaborations DESC,
+              cp.target_name,
+              n.primary_name
+            LIMIT 60;
+          parameters:
+            person_ids: "{{ candidate_person_nconsts }}"
+          param_types:
+            person_ids: text[]
+
+      system_prompt: |
+        You are a final-answer assistant over an IMDb-like database.
+
+        Inputs:
+        - user_query: the original question.
+        - coarse_summary: high-level interpretation from Stage 1.
+        - candidate_movie_tconsts: movie IDs selected by Stage 1.
+        - candidate_person_nconsts: person IDs selected by Stage 1.
+        - SQL result sets:
+          * movie_cast_and_crew: detailed movie + ratings + cast/crew information
+            for the candidate_movie_tconsts.
+          * coappearance_stats: co-appearance statistics between people
+            for the candidate_person_nconsts.
+
+        Tasks:
+        1. Use the SQL results plus the coarse summary to produce a precise,
+           well-grounded answer to the user_query.
+        2. Prefer facts that are directly supported by SQL data
+           (titles, years, ratings, cast, professions, collaboration counts).
+        3. If there are multiple plausible movies/people, explain the ambiguity
+           and mention the top candidates with their IDs (tconst/nconst).
+        4. Do NOT invent movies or people that are not supported by the data.
+
+        Respond ONLY with a single valid JSON object, with no extra text, no comments,
+        and no markdown code fences:
+        {
+          "final_answer": "string",
+          "movie_tconsts": ["tt1234567"],
+          "person_nconsts": ["nm0000123"]
+        }
+
+        Requirements:
+        - All IDs you output must be a subset of the IDs from the SQL result sets
+          or from the candidate_movie_tconsts / candidate_person_nconsts inputs.
+        - If you are unsure, describe the uncertainty in "final_answer" but do not
+          fabricate new movies or people.
+      inputs:
+        - user_query
+        - coarse_summary
+        - candidate_movie_tconsts
+        - candidate_person_nconsts
+      outputs:
+        - final_answer
+        - movie_tconsts
+        - person_nconsts
+
+  edges:
+    - from: user_input
+      to: keyword_extractor
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: keyword_extractor
+      to: stage1_imdb_retrieval
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+
+    - from: stage1_imdb_retrieval
+      to: stage2_imdb_answer
+      mapping:
+        user_query: "{{ user_query }}"
+        coarse_summary: "{{ coarse_summary }}"
+        candidate_movie_tconsts: "{{ candidate_movie_tconsts }}"
+        candidate_person_nconsts: "{{ candidate_person_nconsts }}"

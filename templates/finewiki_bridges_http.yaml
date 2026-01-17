@@ -1,0 +1,314 @@
+graph:
+  name: finewiki_qa_agent_bridge_topology_9nodes_3models_http
+  description: >
+    Bridge-style FineWiki workflow with 9 LLM nodes.
+    A long M_A chain (openai/gpt-oss-20b) is periodically "bridged" by
+    M_B (category, Qwen3-32B) and M_C (language, Qwen3-14B), plus one
+    small helper and a final head.
+    HTTP stand-ins replace the DB queries for bridge entry retrieval.
+    All DB queries depend only on :keyword derived from user_query.
+
+  nodes:
+    - id: user_input
+      type: input
+      outputs:
+        - user_query
+
+    # ===== HTTP stand-ins for FineWiki retrieval =====
+    - id: http_fw_global_pass_a0_main
+      type: http
+      engine: http
+      sleep_s: 2
+      inputs:
+        - user_query
+      outputs:
+        - http_fw_global_pass_a0_main
+
+    - id: http_fw_category_bridge_b1_main
+      type: http
+      engine: http
+      sleep_s: 2
+      inputs:
+        - user_query
+      outputs:
+        - http_fw_category_bridge_b1_main
+
+    - id: http_fw_language_bridge_c1_main
+      type: http
+      engine: http
+      sleep_s: 2
+      inputs:
+        - user_query
+      outputs:
+        - http_fw_language_bridge_c1_main
+
+    # ===== M_A: 长链主干 (openai/gpt-oss-20b) =====
+    - id: fw_global_pass_a0
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        First global pass over FineWiki for the topic.
+        Use http_fw_global_pass_a0_main as your retrieval pool.
+        Respond ONLY with:
+        {
+          "a0_summary": "string"
+        }
+      inputs:
+        - user_query
+        - http_fw_global_pass_a0_main
+      outputs:
+        - a0_summary
+
+    - id: fw_global_pass_a1
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        Refine a0_summary into a structured outline.
+        Respond ONLY with:
+        {
+          "a1_outline": "string"
+        }
+      inputs:
+        - user_query
+        - a0_summary
+      outputs:
+        - a1_outline
+
+    - id: fw_global_pass_a2
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        Expand a1_outline into a longer narrative suitable for
+        downstream bridges and final answering.
+        Respond ONLY with:
+        {
+          "a2_narrative": "string"
+        }
+      inputs:
+        - user_query
+        - a1_outline
+      outputs:
+        - a2_narrative
+
+    # ===== M_B: category bridge (Qwen/Qwen3-32B) =====
+    - id: fw_category_bridge_b1
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+      system_prompt: |
+        Category-based bridge: connect a1_outline with category pages
+        from http_fw_category_bridge_b1_main.
+        Respond ONLY with:
+        {
+          "b1_bridge_notes": "string"
+        }
+      inputs:
+        - user_query
+        - a1_outline
+        - http_fw_category_bridge_b1_main
+      outputs:
+        - b1_bridge_notes
+
+    - id: fw_category_bridge_b2
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+      system_prompt: |
+        Refine b1_bridge_notes into 3–5 key subtopics that are useful
+        for guiding the final answer.
+        Respond ONLY with:
+        {
+          "b2_key_subtopics": ["string", ...]
+        }
+      inputs:
+        - user_query
+        - b1_bridge_notes
+      outputs:
+        - b2_key_subtopics
+
+    # ===== M_C: language bridge (Qwen/Qwen3-14B) =====
+    - id: fw_language_bridge_c1
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        Non-English language bridge for the topic.
+        Use http_fw_language_bridge_c1_main to understand how the topic
+        appears in other languages.
+        Respond ONLY with:
+        {
+          "c1_language_notes": "string"
+        }
+      inputs:
+        - user_query
+        - a0_summary
+        - http_fw_language_bridge_c1_main
+      outputs:
+        - c1_language_notes
+
+    - id: fw_language_bridge_c2
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        Refine c1_language_notes into 2–4 concise cross-lingual
+        insights that can influence the final answer.
+        Respond ONLY with:
+        {
+          "c2_crosslingual_insights": "string"
+        }
+      inputs:
+        - user_query
+        - c1_language_notes
+      outputs:
+        - c2_crosslingual_insights
+
+    # ===== M_S: 轻量辅助 + 最终回答 (使用现有三种模型之一，这里用 Qwen3-14B) =====
+    - id: fw_light_sampler_s0
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        Light sampler for the bridge topology.
+        Condense a2_narrative, b2_key_subtopics, and
+        c2_crosslingual_insights into short hints that are easy for
+        the final answer head to consume.
+        Respond ONLY with:
+        {
+          "s0_hints": ["string", ...]
+        }
+      inputs:
+        - user_query
+        - a2_narrative
+        - b2_key_subtopics
+        - c2_crosslingual_insights
+      outputs:
+        - s0_hints
+
+    - id: fw_final_answer_bridge
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        Final answer assistant for the bridge topology.
+        Combine a2_narrative and s0_hints into a single coherent,
+        well-structured answer to user_query.
+        Respond ONLY with:
+        {
+          "final_answer": "string"
+        }
+      inputs:
+        - user_query
+        - a2_narrative
+        - s0_hints
+      outputs:
+        - final_answer
+
+  edges:
+    - from: user_input
+      to: fw_global_pass_a0
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: user_input
+      to: http_fw_global_pass_a0_main
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: user_input
+      to: http_fw_category_bridge_b1_main
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: user_input
+      to: http_fw_language_bridge_c1_main
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: http_fw_global_pass_a0_main
+      to: fw_global_pass_a0
+      mapping:
+        http_fw_global_pass_a0_main: "{{ http_fw_global_pass_a0_main }}"
+
+    - from: fw_global_pass_a0
+      to: fw_global_pass_a1
+      mapping:
+        user_query: "{{ user_query }}"
+        a0_summary: "{{ a0_summary }}"
+
+    - from: fw_global_pass_a1
+      to: fw_global_pass_a2
+      mapping:
+        user_query: "{{ user_query }}"
+        a1_outline: "{{ a1_outline }}"
+
+    # category bridge off a1
+    - from: fw_global_pass_a1
+      to: fw_category_bridge_b1
+      mapping:
+        user_query: "{{ user_query }}"
+        a1_outline: "{{ a1_outline }}"
+
+    - from: http_fw_category_bridge_b1_main
+      to: fw_category_bridge_b1
+      mapping:
+        http_fw_category_bridge_b1_main: "{{ http_fw_category_bridge_b1_main }}"
+
+    - from: fw_category_bridge_b1
+      to: fw_category_bridge_b2
+      mapping:
+        user_query: "{{ user_query }}"
+        b1_bridge_notes: "{{ b1_bridge_notes }}"
+
+    # language bridge off a0
+    - from: fw_global_pass_a0
+      to: fw_language_bridge_c1
+      mapping:
+        user_query: "{{ user_query }}"
+        a0_summary: "{{ a0_summary }}"
+
+    - from: http_fw_language_bridge_c1_main
+      to: fw_language_bridge_c1
+      mapping:
+        http_fw_language_bridge_c1_main: "{{ http_fw_language_bridge_c1_main }}"
+
+    - from: fw_language_bridge_c1
+      to: fw_language_bridge_c2
+      mapping:
+        user_query: "{{ user_query }}"
+        c1_language_notes: "{{ c1_language_notes }}"
+
+    # small helper merges A/B/C
+    - from: fw_global_pass_a2
+      to: fw_light_sampler_s0
+      mapping:
+        user_query: "{{ user_query }}"
+        a2_narrative: "{{ a2_narrative }}"
+
+    - from: fw_category_bridge_b2
+      to: fw_light_sampler_s0
+      mapping:
+        user_query: "{{ user_query }}"
+        b2_key_subtopics: "{{ b2_key_subtopics }}"
+
+    - from: fw_language_bridge_c2
+      to: fw_light_sampler_s0
+      mapping:
+        user_query: "{{ user_query }}"
+        c2_crosslingual_insights: "{{ c2_crosslingual_insights }}"
+
+    # final answer depends on main chain tail + helper
+    - from: fw_global_pass_a2
+      to: fw_final_answer_bridge
+      mapping:
+        user_query: "{{ user_query }}"
+        a2_narrative: "{{ a2_narrative }}"
+
+    - from: fw_light_sampler_s0
+      to: fw_final_answer_bridge
+      mapping:
+        user_query: "{{ user_query }}"
+        s0_hints: "{{ s0_hints }}"

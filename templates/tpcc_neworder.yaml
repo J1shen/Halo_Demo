@@ -1,0 +1,616 @@
+graph:
+  name: tpcc_new_order_ai_diamond_v1
+  description: >
+    TPC-C New-Order (BenchmarkSQL style, useStoredProcedures=false) split into
+    DB read/lock -> LLM compute -> DB writes, with extra LLM reasoning nodes.
+    All SQLs target BenchmarkSQL tables (bmsql_*).
+    Assumes the runtime can keep a single DB session/transaction across the
+    chained DB nodes for one request context (FOR UPDATE correctness).
+
+  nodes:
+    - id: user_input
+      type: input
+      outputs:
+        - user_query
+
+    # ===== 1) parameter planner (LLM-only, Model A) =====
+    - id: tpcc_param_planner_openai20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        You are the TPC-C parameter planner for a SINGLE New-Order transaction.
+        Produce concrete parameters (integers/decimals) that make the SQL runnable.
+
+        Constraints (typical TPCC / BenchmarkSQL):
+        - w_id in [1, warehouses]
+        - d_id in [1, 10]
+        - c_id in [1, 3000]
+        - i_id in [1, 100000]
+        - ol_qty in [1, 10]
+        - supply_w_id usually equals w_id (local order)
+        - o_all_local = 1 for local
+
+        Respond ONLY with:
+        {
+          "w_id": 1,
+          "d_id": 1,
+          "c_id": 1,
+          "i_id": 1,
+          "supply_w_id": 1,
+          "ol_qty": 5,
+          "o_all_local": 1
+        }
+      inputs:
+        - user_query
+      outputs:
+        - w_id
+        - d_id
+        - c_id
+        - i_id
+        - supply_w_id
+        - ol_qty
+        - o_all_local
+
+    # ===== 2) quick DB sanity checks (DB-only) =====
+    - id: tpcc_sanity_db
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      db_queries:
+        - name: tpcc_sanity_customer
+          sql: >
+            SELECT COUNT(*)::int AS ok
+            FROM bmsql_customer
+            WHERE c_w_id = :w_id AND c_d_id = :d_id AND c_id = :c_id;
+          parameters:
+            w_id: "{{ w_id }}"
+            d_id: "{{ d_id }}"
+            c_id: "{{ c_id }}"
+          param_types:
+            w_id: int
+            d_id: int
+            c_id: int
+
+        - name: tpcc_sanity_item
+          sql: >
+            SELECT COUNT(*)::int AS ok
+            FROM bmsql_item
+            WHERE i_id = :i_id;
+          parameters:
+            i_id: "{{ i_id }}"
+          param_types:
+            i_id: int
+
+        - name: tpcc_sanity_stock
+          sql: >
+            SELECT COUNT(*)::int AS ok
+            FROM bmsql_stock
+            WHERE s_w_id = :supply_w_id AND s_i_id = :i_id;
+          parameters:
+            supply_w_id: "{{ supply_w_id }}"
+            i_id: "{{ i_id }}"
+          param_types:
+            supply_w_id: int
+            i_id: int
+      system_prompt: |
+        Sanity node.
+        Read the 3 sanity query results.
+        If any ok==0, explain which key is missing.
+        Respond ONLY with:
+        {
+          "sanity_ok": true,
+          "sanity_notes": "string"
+        }
+      inputs:
+        - user_query
+        - w_id
+        - d_id
+        - c_id
+        - i_id
+        - supply_w_id
+      outputs:
+        - sanity_ok
+        - sanity_notes
+
+    # ===== 3) lock/read district (FOR UPDATE) + read customer+warehouse tax (DB) =====
+    - id: tpcc_read_lock_phase_db
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+      db_queries:
+        # BenchmarkSQL: SELECT customer discount/credit + warehouse tax
+        - name: tpcc_no_select_whse_cust
+          sql: >
+            SELECT
+              c_discount,
+              c_last,
+              c_credit,
+              w_tax
+            FROM bmsql_customer
+            JOIN bmsql_warehouse ON (w_id = c_w_id)
+            WHERE c_w_id = :w_id AND c_d_id = :d_id AND c_id = :c_id;
+          parameters:
+            w_id: "{{ w_id }}"
+            d_id: "{{ d_id }}"
+            c_id: "{{ c_id }}"
+          param_types:
+            w_id: int
+            d_id: int
+            c_id: int
+
+        # BenchmarkSQL: SELECT d_tax, d_next_o_id FOR UPDATE
+        - name: tpcc_no_select_dist_for_update
+          sql: >
+            SELECT d_tax, d_next_o_id
+            FROM bmsql_district
+            WHERE d_w_id = :w_id AND d_id = :d_id
+            FOR UPDATE;
+          parameters:
+            w_id: "{{ w_id }}"
+            d_id: "{{ d_id }}"
+          param_types:
+            w_id: int
+            d_id: int
+      system_prompt: |
+        Extract the locked district next order id and taxes.
+        Respond ONLY with:
+        {
+          "d_next_o_id": 1,
+          "d_tax": 0.05,
+          "w_tax": 0.07,
+          "c_discount": 0.02,
+          "c_credit": "GC",
+          "c_last": "string"
+        }
+      inputs:
+        - user_query
+        - w_id
+        - d_id
+        - c_id
+      outputs:
+        - d_next_o_id
+        - d_tax
+        - w_tax
+        - c_discount
+        - c_credit
+        - c_last
+
+    # ===== 4) write order header + bump district (DB writes) =====
+    - id: tpcc_order_header_write_db
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      db_queries:
+        # BenchmarkSQL: UPDATE district next_o_id
+        - name: tpcc_no_update_dist
+          sql: >
+            UPDATE bmsql_district
+            SET d_next_o_id = d_next_o_id + 1
+            WHERE d_w_id = :w_id AND d_id = :d_id;
+          parameters:
+            w_id: "{{ w_id }}"
+            d_id: "{{ d_id }}"
+          param_types:
+            w_id: int
+            d_id: int
+
+        # BenchmarkSQL: INSERT oorder
+        - name: tpcc_no_insert_oorder
+          sql: >
+            INSERT INTO bmsql_oorder (
+              o_id, o_d_id, o_w_id, o_c_id, o_entry_d,
+              o_ol_cnt, o_all_local
+            )
+            VALUES (
+              :o_id, :d_id, :w_id, :c_id, NOW(),
+              :o_ol_cnt, :o_all_local
+            );
+          parameters:
+            o_id: "{{ d_next_o_id }}"
+            d_id: "{{ d_id }}"
+            w_id: "{{ w_id }}"
+            c_id: "{{ c_id }}"
+            o_ol_cnt: 1
+            o_all_local: "{{ o_all_local }}"
+          param_types:
+            o_id: int
+            d_id: int
+            w_id: int
+            c_id: int
+            o_ol_cnt: int
+            o_all_local: int
+
+        # BenchmarkSQL: INSERT new_order
+        - name: tpcc_no_insert_new_order
+          sql: >
+            INSERT INTO bmsql_new_order (no_o_id, no_d_id, no_w_id)
+            VALUES (:o_id, :d_id, :w_id);
+          parameters:
+            o_id: "{{ d_next_o_id }}"
+            d_id: "{{ d_id }}"
+            w_id: "{{ w_id }}"
+          param_types:
+            o_id: int
+            d_id: int
+            w_id: int
+      system_prompt: |
+        Header write done.
+        Respond ONLY with:
+        {
+          "o_id": 1,
+          "header_write_notes": "string"
+        }
+      inputs:
+        - w_id
+        - d_id
+        - c_id
+        - d_next_o_id
+        - o_all_local
+      outputs:
+        - o_id
+        - header_write_notes
+
+    # ===== 5) read stock FOR UPDATE + read item (DB) =====
+    - id: tpcc_stock_item_read_db
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      db_queries:
+        # BenchmarkSQL: SELECT stock ... FOR UPDATE (reads dist_01..10)
+        - name: tpcc_no_select_stock_for_update
+          sql: >
+            SELECT
+              s_quantity, s_data,
+              s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05,
+              s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10
+            FROM bmsql_stock
+            WHERE s_w_id = :supply_w_id AND s_i_id = :i_id
+            FOR UPDATE;
+          parameters:
+            supply_w_id: "{{ supply_w_id }}"
+            i_id: "{{ i_id }}"
+          param_types:
+            supply_w_id: int
+            i_id: int
+
+        # BenchmarkSQL: SELECT item price/name/data
+        - name: tpcc_no_select_item
+          sql: >
+            SELECT i_price, i_name, i_data
+            FROM bmsql_item
+            WHERE i_id = :i_id;
+          parameters:
+            i_id: "{{ i_id }}"
+          param_types:
+            i_id: int
+      system_prompt: |
+        Summarize raw stock+item rows (do not invent values).
+        Respond ONLY with:
+        {
+          "s_quantity": 0,
+          "s_data": "string",
+          "s_dist_01": "string",
+          "s_dist_02": "string",
+          "s_dist_03": "string",
+          "s_dist_04": "string",
+          "s_dist_05": "string",
+          "s_dist_06": "string",
+          "s_dist_07": "string",
+          "s_dist_08": "string",
+          "s_dist_09": "string",
+          "s_dist_10": "string",
+          "i_price": 0.0,
+          "i_name": "string",
+          "i_data": "string"
+        }
+      inputs:
+        - w_id
+        - d_id
+        - i_id
+        - supply_w_id
+      outputs:
+        - s_quantity
+        - s_data
+        - s_dist_01
+        - s_dist_02
+        - s_dist_03
+        - s_dist_04
+        - s_dist_05
+        - s_dist_06
+        - s_dist_07
+        - s_dist_08
+        - s_dist_09
+        - s_dist_10
+        - i_price
+        - i_name
+        - i_data
+
+    # ===== 6) LLM compute phase: derive new stock quantity, dist_info, ol_amount =====
+    - id: tpcc_new_order_compute_qwen32b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+      system_prompt: |
+        Compute derived values for a SINGLE order line.
+
+        TPC-C stock update rule (common implementation):
+        - If s_quantity >= ol_qty + 10: new_s_quantity = s_quantity - ol_qty
+          else: new_s_quantity = s_quantity - ol_qty + 91
+        - remote_inc = 1 if supply_w_id != w_id else 0
+        - ol_amount = i_price * ol_qty
+        - ol_dist_info picks s_dist_{d_id:02d} (01..10)
+
+        Respond ONLY with:
+        {
+          "new_s_quantity": 0,
+          "remote_inc": 0,
+          "ol_amount": 0.0,
+          "ol_dist_info": "string",
+          "compute_notes": "string"
+        }
+      inputs:
+        - w_id
+        - d_id
+        - supply_w_id
+        - ol_qty
+        - s_quantity
+        - s_dist_01
+        - s_dist_02
+        - s_dist_03
+        - s_dist_04
+        - s_dist_05
+        - s_dist_06
+        - s_dist_07
+        - s_dist_08
+        - s_dist_09
+        - s_dist_10
+        - i_price
+      outputs:
+        - new_s_quantity
+        - remote_inc
+        - ol_amount
+        - ol_dist_info
+        - compute_notes
+
+    # ===== 7) DB writes: update stock + insert order_line (DB) =====
+    - id: tpcc_order_line_write_db
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      db_queries:
+        # BenchmarkSQL: UPDATE stock
+        - name: tpcc_no_update_stock
+          sql: >
+            UPDATE bmsql_stock
+            SET
+              s_quantity = :new_s_quantity,
+              s_ytd = s_ytd + :ol_qty,
+              s_order_cnt = s_order_cnt + 1,
+              s_remote_cnt = s_remote_cnt + :remote_inc
+            WHERE s_w_id = :supply_w_id AND s_i_id = :i_id;
+          parameters:
+            new_s_quantity: "{{ new_s_quantity }}"
+            ol_qty: "{{ ol_qty }}"
+            remote_inc: "{{ remote_inc }}"
+            supply_w_id: "{{ supply_w_id }}"
+            i_id: "{{ i_id }}"
+          param_types:
+            new_s_quantity: int
+            ol_qty: int
+            remote_inc: int
+            supply_w_id: int
+            i_id: int
+
+        # BenchmarkSQL: INSERT order_line
+        - name: tpcc_no_insert_order_line
+          sql: >
+            INSERT INTO bmsql_order_line (
+              ol_o_id, ol_d_id, ol_w_id, ol_number, ol_i_id,
+              ol_supply_w_id, ol_delivery_d, ol_quantity, ol_amount, ol_dist_info
+            )
+            VALUES (
+              :o_id, :d_id, :w_id, 1, :i_id,
+              :supply_w_id, NULL, :ol_qty, :ol_amount, :ol_dist_info
+            );
+          parameters:
+            o_id: "{{ o_id }}"
+            d_id: "{{ d_id }}"
+            w_id: "{{ w_id }}"
+            i_id: "{{ i_id }}"
+            supply_w_id: "{{ supply_w_id }}"
+            ol_qty: "{{ ol_qty }}"
+            ol_amount: "{{ ol_amount }}"
+            ol_dist_info: "{{ ol_dist_info }}"
+          param_types:
+            o_id: int
+            d_id: int
+            w_id: int
+            i_id: int
+            supply_w_id: int
+            ol_qty: int
+            ol_amount: float
+            ol_dist_info: text
+      system_prompt: |
+        Order line write done.
+        Respond ONLY with:
+        {
+          "write_ok": true,
+          "write_notes": "string"
+        }
+      inputs:
+        - o_id
+        - w_id
+        - d_id
+        - i_id
+        - supply_w_id
+        - ol_qty
+        - new_s_quantity
+        - remote_inc
+        - ol_amount
+        - ol_dist_info
+      outputs:
+        - write_ok
+        - write_notes
+
+    # ===== 8) final reasoning / explanation (LLM-only) =====
+    - id: tpcc_final_explain_openai20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        Final assistant.
+        Explain what happened in this New-Order transaction in plain language,
+        grounded in the computed + written values. Mention:
+        - chosen (w_id,d_id,c_id,i_id,supply_w_id,ol_qty)
+        - derived (o_id, ol_amount, new_s_quantity, remote_inc)
+        - any sanity warnings
+        Respond ONLY with:
+        {
+          "final_answer": "string"
+        }
+      inputs:
+        - user_query
+        - sanity_ok
+        - sanity_notes
+        - w_id
+        - d_id
+        - c_id
+        - i_id
+        - supply_w_id
+        - ol_qty
+        - o_id
+        - ol_amount
+        - new_s_quantity
+        - remote_inc
+        - header_write_notes
+        - compute_notes
+        - write_ok
+        - write_notes
+      outputs:
+        - final_answer
+
+  edges:
+    - from: user_input
+      to: tpcc_param_planner_openai20b
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: tpcc_param_planner_openai20b
+      to: tpcc_sanity_db
+      mapping:
+        user_query: "{{ user_query }}"
+        w_id: "{{ w_id }}"
+        d_id: "{{ d_id }}"
+        c_id: "{{ c_id }}"
+        i_id: "{{ i_id }}"
+        supply_w_id: "{{ supply_w_id }}"
+
+    - from: tpcc_param_planner_openai20b
+      to: tpcc_read_lock_phase_db
+      mapping:
+        user_query: "{{ user_query }}"
+        w_id: "{{ w_id }}"
+        d_id: "{{ d_id }}"
+        c_id: "{{ c_id }}"
+
+    - from: tpcc_read_lock_phase_db
+      to: tpcc_order_header_write_db
+      mapping:
+        w_id: "{{ w_id }}"
+        d_id: "{{ d_id }}"
+        c_id: "{{ c_id }}"
+        d_next_o_id: "{{ d_next_o_id }}"
+        o_all_local: "{{ o_all_local }}"
+
+    - from: tpcc_param_planner_openai20b
+      to: tpcc_stock_item_read_db
+      mapping:
+        w_id: "{{ w_id }}"
+        d_id: "{{ d_id }}"
+        i_id: "{{ i_id }}"
+        supply_w_id: "{{ supply_w_id }}"
+
+    - from: tpcc_order_header_write_db
+      to: tpcc_new_order_compute_qwen32b
+      mapping:
+        w_id: "{{ w_id }}"
+        d_id: "{{ d_id }}"
+        supply_w_id: "{{ supply_w_id }}"
+        ol_qty: "{{ ol_qty }}"
+
+    - from: tpcc_stock_item_read_db
+      to: tpcc_new_order_compute_qwen32b
+      mapping:
+        w_id: "{{ w_id }}"
+        d_id: "{{ d_id }}"
+        supply_w_id: "{{ supply_w_id }}"
+        ol_qty: "{{ ol_qty }}"
+        s_quantity: "{{ s_quantity }}"
+        s_dist_01: "{{ s_dist_01 }}"
+        s_dist_02: "{{ s_dist_02 }}"
+        s_dist_03: "{{ s_dist_03 }}"
+        s_dist_04: "{{ s_dist_04 }}"
+        s_dist_05: "{{ s_dist_05 }}"
+        s_dist_06: "{{ s_dist_06 }}"
+        s_dist_07: "{{ s_dist_07 }}"
+        s_dist_08: "{{ s_dist_08 }}"
+        s_dist_09: "{{ s_dist_09 }}"
+        s_dist_10: "{{ s_dist_10 }}"
+        i_price: "{{ i_price }}"
+
+    - from: tpcc_order_header_write_db
+      to: tpcc_order_line_write_db
+      mapping:
+        o_id: "{{ o_id }}"
+        w_id: "{{ w_id }}"
+        d_id: "{{ d_id }}"
+        i_id: "{{ i_id }}"
+        supply_w_id: "{{ supply_w_id }}"
+        ol_qty: "{{ ol_qty }}"
+
+    - from: tpcc_new_order_compute_qwen32b
+      to: tpcc_order_line_write_db
+      mapping:
+        new_s_quantity: "{{ new_s_quantity }}"
+        remote_inc: "{{ remote_inc }}"
+        ol_amount: "{{ ol_amount }}"
+        ol_dist_info: "{{ ol_dist_info }}"
+
+    - from: tpcc_sanity_db
+      to: tpcc_final_explain_openai20b
+      mapping:
+        user_query: "{{ user_query }}"
+        sanity_ok: "{{ sanity_ok }}"
+        sanity_notes: "{{ sanity_notes }}"
+
+    - from: tpcc_order_header_write_db
+      to: tpcc_final_explain_openai20b
+      mapping:
+        header_write_notes: "{{ header_write_notes }}"
+        o_id: "{{ o_id }}"
+
+    - from: tpcc_new_order_compute_qwen32b
+      to: tpcc_final_explain_openai20b
+      mapping:
+        ol_amount: "{{ ol_amount }}"
+        new_s_quantity: "{{ new_s_quantity }}"
+        remote_inc: "{{ remote_inc }}"
+        compute_notes: "{{ compute_notes }}"
+
+    - from: tpcc_order_line_write_db
+      to: tpcc_final_explain_openai20b
+      mapping:
+        write_ok: "{{ write_ok }}"
+        write_notes: "{{ write_notes }}"
+
+    - from: tpcc_param_planner_openai20b
+      to: tpcc_final_explain_openai20b
+      mapping:
+        user_query: "{{ user_query }}"
+        w_id: "{{ w_id }}"
+        d_id: "{{ d_id }}"
+        c_id: "{{ c_id }}"
+        i_id: "{{ i_id }}"
+        supply_w_id: "{{ supply_w_id }}"
+        ol_qty: "{{ ol_qty }}"

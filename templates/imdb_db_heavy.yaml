@@ -1,0 +1,266 @@
+graph:
+  name: imdb_db_heavy_2stage_oss20b_8sql_nonconsecutive_v1
+  description: >
+    DB-heavy IMDb QA template with two OSS 20B LLM nodes (same model).
+    Stage 1 extracts search_keyword.
+    Stage 2 runs 8 SQL queries such that adjacent queries do NOT use the same primary table
+    (no consecutive repeats like name_basics then name_basics).
+    Tables interleaved across: title_basics(+ratings), name_basics, title_akas,
+    title_crew, title_principals, title_episode.
+
+  nodes:
+    - id: user_input
+      type: input
+      outputs:
+        - user_query
+
+    # ===== 1) LLM1: keyword planner (OSS 20B) =====
+    - id: keyword_planner_oss20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        You are the keyword planner for an IMDb database.
+        From user_query, output a compact search_keyword for ILIKE filters.
+
+        Respond ONLY with JSON:
+        {
+          "search_keyword": "string"
+        }
+      inputs:
+        - user_query
+      outputs:
+        - search_keyword
+
+    # ===== 2) LLM2: DB-heavy grounded answer (OSS 20B) =====
+    - id: imdb_db_answer_oss20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      db_queries:
+
+        # Q1 (title_basics + title_ratings)
+        - name: q1_title_candidates
+          sql: >
+            SELECT
+              b.tconst,
+              b.title_type,
+              b.primary_title,
+              b.original_title,
+              b.start_year,
+              b.runtime_minutes,
+              b.genres,
+              r.average_rating,
+              r.num_votes
+            FROM title_basics AS b
+            LEFT JOIN title_ratings AS r
+              ON r.tconst = b.tconst
+            WHERE
+              (b.primary_title ILIKE '%%' || :keyword || '%%'
+               OR b.original_title ILIKE '%%' || :keyword || '%%')
+            ORDER BY COALESCE(r.num_votes, 0) DESC
+            LIMIT 25;
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+
+        # Q2 (name_basics)
+        - name: q2_person_by_name
+          sql: >
+            SELECT
+              n.nconst,
+              n.primary_name,
+              n.birth_year,
+              n.death_year,
+              n.primary_profession,
+              n.known_for_titles
+            FROM name_basics AS n
+            WHERE
+              n.primary_name ILIKE '%%' || :keyword || '%%'
+            ORDER BY n.primary_name
+            LIMIT 25;
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+
+        # Q3 (title_akas)
+        - name: q3_akas_by_title
+          sql: >
+            SELECT
+              a.title_id,
+              a.title,
+              a.region,
+              a.language,
+              a.is_original_title
+            FROM title_akas AS a
+            WHERE
+              a.title ILIKE '%%' || :keyword || '%%'
+            ORDER BY a.is_original_title DESC, a.ordering
+            LIMIT 25;
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+
+        # Q4 (title_crew)  [subquery uses title_basics, but primary table is title_crew]
+        - name: q4_crew_for_candidates
+          sql: >
+            SELECT
+              c.tconst,
+              c.directors,
+              c.writers
+            FROM title_crew AS c
+            WHERE
+              c.tconst IN (
+                SELECT b.tconst
+                FROM title_basics AS b
+                WHERE
+                  (b.primary_title ILIKE '%%' || :keyword || '%%'
+                   OR b.original_title ILIKE '%%' || :keyword || '%%')
+                LIMIT 25
+              );
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+
+        # Q5 (name_basics)  [NOT consecutive with Q2; separated by Q3+Q4]
+        - name: q5_person_by_profession
+          sql: >
+            SELECT
+              n.nconst,
+              n.primary_name,
+              n.primary_profession,
+              n.known_for_titles
+            FROM name_basics AS n
+            WHERE
+              n.primary_profession ILIKE '%%' || :keyword || '%%'
+            ORDER BY n.nconst
+            LIMIT 25;
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+
+        # Q6 (title_principals)
+        - name: q6_principals_for_candidates
+          sql: >
+            SELECT
+              p.tconst,
+              p.ordering,
+              p.nconst,
+              p.category,
+              p.job,
+              p.characters
+            FROM title_principals AS p
+            WHERE
+              p.tconst IN (
+                SELECT b.tconst
+                FROM title_basics AS b
+                WHERE
+                  (b.primary_title ILIKE '%%' || :keyword || '%%'
+                   OR b.original_title ILIKE '%%' || :keyword || '%%')
+                LIMIT 15
+              )
+            ORDER BY p.tconst, p.ordering
+            LIMIT 120;
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+
+        # Q7 (title_episode)
+        - name: q7_episode_samples_for_series
+          sql: >
+            SELECT
+              e.parent_tconst,
+              e.tconst AS episode_tconst,
+              e.season_number,
+              e.episode_number
+            FROM title_episode AS e
+            WHERE
+              e.parent_tconst IN (
+                SELECT b.tconst
+                FROM title_basics AS b
+                WHERE
+                  b.title_type = 'tvSeries'
+                  AND (b.primary_title ILIKE '%%' || :keyword || '%%'
+                       OR b.original_title ILIKE '%%' || :keyword || '%%')
+                LIMIT 10
+              )
+            ORDER BY e.parent_tconst, e.season_number, e.episode_number
+            LIMIT 80;
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+
+        # Q8 (title_basics + title_ratings)  [NOT consecutive with Q1; separated by others]
+        - name: q8_recent_titles
+          sql: >
+            SELECT
+              b.tconst,
+              b.title_type,
+              b.primary_title,
+              b.start_year,
+              b.genres,
+              r.average_rating,
+              r.num_votes
+            FROM title_basics AS b
+            LEFT JOIN title_ratings AS r
+              ON r.tconst = b.tconst
+            WHERE
+              b.start_year IS NOT NULL
+              AND b.start_year >= 2000
+              AND (b.primary_title ILIKE '%%' || :keyword || '%%'
+                   OR b.original_title ILIKE '%%' || :keyword || '%%')
+            ORDER BY COALESCE(r.num_votes, 0) DESC
+            LIMIT 15;
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+
+      system_prompt: |
+        You are a DB-grounded IMDb QA assistant.
+        You will receive user_query, search_keyword, and 8 SQL result sets (q1..q8).
+
+        Use SQL results as the source of truth and reconcile across tables:
+        - q1/q8: title candidates + ratings
+        - q2/q5: people by name / profession
+        - q3: akas / alternate titles
+        - q4: crew IDs (directors/writers)
+        - q6: principals (cast/crew categories)
+        - q7: episode navigation for series
+
+        Strict grounding:
+        - Do NOT invent names for nconst IDs unless they appear in q2/q5.
+        - If results are sparse, say so and suggest a refined keyword.
+
+        Respond ONLY with JSON:
+        {
+          "search_keyword": "string",
+          "top_titles": [{"tconst":"...", "primary_title":"...", "start_year":0, "title_type":"...", "evidence":["q1","q8","q3"]}],
+          "relevant_people": [{"nconst":"...", "primary_name":"...", "primary_profession":"...", "evidence":["q2","q5","q6","q4"]}],
+          "connections": "string",
+          "final_answer": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+      outputs:
+        - final_answer
+
+  edges:
+    - from: user_input
+      to: keyword_planner_oss20b
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: keyword_planner_oss20b
+      to: imdb_db_answer_oss20b
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"

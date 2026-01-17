@@ -1,0 +1,25 @@
+{
+    "model": "Qwen/Qwen3-14B",
+    "engine_name": "engine-imdb-b",
+    "host": "0.0.0.0",
+    "port": 9202,
+    "engine_type": "openai",
+    "random_seed": 0,
+    "tokenizer": "Qwen/Qwen3-14B",
+    "tasks_capacity": 9999999999,
+    "instance": {
+        "api_key": "YOUR_API_KEY",
+        "api_endpoint": "completion",
+        "base_url": "http://localhost:9102/v1",
+        "is_azure": false
+    },
+    "scheduler": {
+        "max_batch_size": 99999999,
+        "max_num_batched_tokens": 99999999,
+        "max_total_tokens": 99999999
+    },
+    "serve_core": {
+        "host": "localhost",
+        "port": 9000
+    }
+}

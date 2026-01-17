@@ -1,0 +1,110 @@
+graph:
+  name: llm_linear_3stage_qwen3_06b_17b_4b_v1
+  description: >
+    Linear 3-stage, LLM-only workflow (no DB).
+    Stage 1 (Qwen3-0.6B): classify intent + extract entities/slots + minimal plan.
+    Stage 2 (Qwen3-1.7B): produce a clean draft answer following the plan.
+    Stage 3 (Qwen3-4B): lightly refine and finalize the response.
+    All stages operate on the same user_query with explicit intermediate outputs.
+
+  examples:
+    - user_query: "Who directed Inception?"
+    - user_query: "Movies starring Tom Cruise."
+    - user_query: "What movies did Leonardo DiCaprio act in?"
+    - user_query: "Christopher Nolan filmography."
+    - user_query: "Top rated sci-fi movies."
+    - user_query: "Show me Brad Pitt’s best movies."
+    - user_query: "Movies released in 2020."
+
+  nodes:
+    - id: user_input
+      type: input
+      outputs:
+        - user_query
+
+    # ===== 1) Stage 1: tiny planner (Qwen3-0.6B) =====
+    - id: stage1_plan_qwen06b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-0.6B
+      system_prompt: |
+        Stage 1 (Planner).
+        Extract intent + key entities and make a short outline.
+        Do not answer the question.
+
+        Output JSON only:
+        {
+          "intent": "director | filmography | starring | top_rated | released_in_year | other",
+          "entities": {
+            "person": "string_or_null",
+            "title": "string_or_null",
+            "genre": "string_or_null",
+            "year": "int_or_null"
+          },
+          "constraints": ["..."],
+          "outline": ["step1", "step2"]
+        }
+      inputs:
+        - user_query
+      outputs:
+        - stage1_plan_json
+
+    # ===== 2) Stage 2: small drafter (Qwen3-1.7B) =====
+    - id: stage2_draft_qwen17b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-1.7B
+      system_prompt: |
+        Stage 2 (Draft).
+        Follow stage1_plan_json to write a helpful draft.
+        If facts are unknown without a database, say so briefly and give a reasonable way to proceed.
+
+        Output JSON only:
+        {
+          "draft_answer": "string",
+          "assumptions": ["..."]
+        }
+      inputs:
+        - user_query
+        - stage1_plan_json
+      outputs:
+        - stage2_draft_json
+
+    # ===== 3) Stage 3: light refiner (Qwen3-4B) =====
+    - id: stage3_finalize_qwen4b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-4B
+      system_prompt: |
+        Stage 3 (Finalize).
+        Improve clarity and concision, remove repetition, keep the answer direct.
+
+        Output JSON only:
+        {
+          "final_answer": "string"
+        }
+      inputs:
+        - user_query
+        - stage1_plan_json
+        - stage2_draft_json
+      outputs:
+        - final_answer
+
+  edges:
+    - from: user_input
+      to: stage1_plan_qwen06b
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: stage1_plan_qwen06b
+      to: stage2_draft_qwen17b
+      mapping:
+        user_query: "{{ user_query }}"
+        stage1_plan_json: "{{ stage1_plan_json }}"
+
+    - from: stage2_draft_qwen17b
+      to: stage3_finalize_qwen4b
+      mapping:
+        user_query: "{{ user_query }}"
+        stage1_plan_json: "{{ stage1_plan_json }}"
+        stage2_draft_json: "{{ stage2_draft_json }}"

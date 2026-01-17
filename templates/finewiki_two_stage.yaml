@@ -1,0 +1,127 @@
+graph:
+  name: finewiki_qa_agent_2stage
+  description: >
+    A simplified 2-stage QA workflow over the HuggingFaceFW/finewiki DB.
+    Stage 1 performs retrieval + coarse summary.
+    Stage 2 produces final answer and writes it back.
+
+  nodes:
+    - id: user_input
+      type: input
+      outputs:
+        - user_query
+
+    # ===== Stage 1: 检索 + 初步summary =====
+    - id: stage1_retrieval
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      db_queries:
+        - name: search_wikitext
+          sql: >
+            SELECT page_id, title, url, wikitext
+            FROM pages
+            WHERE in_language = 'en'
+              AND to_tsvector('english', coalesce(wikitext, ''))
+                  @@ plainto_tsquery('english', :keyword)
+            ORDER BY date_modified DESC
+            LIMIT 20;
+          parameters:
+            keyword: "{{ user_query }}"
+          param_types:
+            keyword: text
+
+        - name: search_title
+          sql: >
+            SELECT p.page_id, p.title, p.url, p.wikitext, a.final_answer AS related_answer
+            FROM pages p
+            LEFT JOIN finewiki_answers a
+              ON a.question = p.title
+            WHERE p.in_language = 'en'
+              AND to_tsvector('english', p.title)
+                  @@ plainto_tsquery('english', :keyword)
+            ORDER BY p.date_modified DESC
+            LIMIT 10;
+          parameters:
+            keyword: "{{ user_query }}"
+          param_types:
+            keyword: text
+      system_prompt: |
+        You are a retrieval and summarization assistant.
+        You receive result sets from two SQL queries over a wiki-like DB.
+        Tasks:
+        1. Merge & deduplicate pages.
+        2. Identify the most relevant pages (3–8 pages).
+        3. Produce a concise coarse summary for the query.
+        Respond ONLY with JSON:
+        {
+          "coarse_summary": "string",
+          "candidate_page_ids": [integer, ...]
+        }
+      inputs:
+        - user_query
+      outputs:
+        - coarse_summary
+        - candidate_page_ids
+
+    # ===== Stage 2: 最终回答 + 写回数据库 =====
+    - id: stage2_answer_and_writeback
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      db_queries:
+        - name: lookup_previous_answers
+          sql: >
+            SELECT id, question, final_answer, wiki_summary
+            FROM finewiki_answers
+            WHERE question ILIKE '%%' || :keyword || '%%'
+            ORDER BY id DESC
+            LIMIT 5;
+          parameters:
+            keyword: "{{ user_query }}"
+          param_types:
+            keyword: text
+
+        - name: recent_page_answer_join
+          sql: >
+            SELECT p.page_id, p.title, p.url, p.wikitext, a.final_answer AS stored_answer
+            FROM pages p
+            LEFT JOIN finewiki_answers a
+              ON a.question = p.title
+            WHERE p.in_language = 'en'
+              AND p.title ILIKE '%%' || :keyword || '%%'
+            ORDER BY p.date_modified DESC
+            LIMIT 8;
+          parameters:
+            keyword: "{{ user_query }}"
+          param_types:
+            keyword: text
+
+      system_prompt: |
+        You are a final-answer assistant.
+        Using the coarse summary and candidate pages, produce a precise,
+        well-grounded final answer. Mention uncertainty when appropriate.
+        Respond ONLY with JSON:
+        {
+          "final_answer": "string",
+          "answer_id": integer
+        }
+      inputs:
+        - user_query
+        - coarse_summary
+        - candidate_page_ids
+      outputs:
+        - final_answer
+
+  edges:
+    - from: user_input
+      to: stage1_retrieval
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: stage1_retrieval
+      to: stage2_answer_and_writeback
+      mapping:
+        user_query: "{{ user_query }}"
+        coarse_summary: "{{ coarse_summary }}"
+        candidate_page_ids: "{{ candidate_page_ids }}"

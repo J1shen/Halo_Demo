@@ -1,0 +1,426 @@
+graph:
+  name: imdb_qa_agent_diamond_http_v1
+  description: >
+    Simplified 9-node diamond-style IMDb workflow.
+    A keyword planner fans out into three entry nodes
+    (movies, people, akas), which merge into two hubs, then a single
+    tail node and a final answer node.
+    All SQL queries depend only on a shared search_keyword.
+
+  nodes:
+    - id: user_input
+      type: input
+      outputs:
+        - user_query
+
+    # ===== 1. keyword planner (LLM-only, Model A) =====
+    - id: keyword_planner
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        You are the keyword planner.
+        From user_query, generate a concise search_keyword suitable for
+        ILIKE filters on movie titles, person names, and AKA titles.
+        Respond ONLY with:
+        {
+          "search_keyword": "string"
+        }
+      inputs:
+        - user_query
+      outputs:
+        - search_keyword
+
+    # ===== 2. HTTP stand-ins for movie entry queries =====
+
+    - id: http_entry_movie_by_title
+      type: http
+      engine: http
+      sleep_s: 2
+      inputs:
+        - search_keyword
+      outputs:
+        - http_entry_movie_by_title
+
+    - id: http_entry_movie_recent
+      type: http
+      engine: http
+      sleep_s: 2
+      inputs:
+        - search_keyword
+      outputs:
+        - http_entry_movie_recent
+
+    # ===== 3–5. entry fan-out: movies / people / akas =====
+
+    - id: entry_movie_qwen14b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        Entry A (movie-centric).
+        Use http_entry_movie_by_title and http_entry_movie_recent
+        payloads to summarize representative candidate titles related
+        to the search_keyword.
+        Respond ONLY with:
+        {
+          "entry_movie_notes": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+        - http_entry_movie_by_title
+        - http_entry_movie_recent
+      outputs:
+        - entry_movie_notes
+
+    - id: entry_person_openai20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      db_queries:
+        - name: imdb_entry_person_by_name
+          sql: >
+            SELECT
+              n.nconst,
+              n.primary_name,
+              n.primary_profession,
+              n.known_for_titles
+            FROM name_basics AS n
+            WHERE
+              n.primary_name ILIKE '%%' || :keyword || '%%'
+            ORDER BY n.primary_name
+            LIMIT 25;
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+        - name: imdb_entry_person_by_profession
+          sql: >
+            SELECT
+              n.nconst,
+              n.primary_name,
+              n.primary_profession,
+              n.known_for_titles
+            FROM name_basics AS n
+            WHERE
+              n.primary_profession ILIKE '%%' || :keyword || '%%'
+            ORDER BY n.nconst
+            LIMIT 20;
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+      system_prompt: |
+        Entry B (people-centric).
+        Use imdb_entry_person_by_name and imdb_entry_person_by_profession
+        to identify people relevant to the search_keyword and summarize
+        why they matter.
+        Respond ONLY with:
+        {
+          "entry_person_notes": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+      outputs:
+        - entry_person_notes
+
+    - id: entry_akas_qwen32b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+      db_queries:
+        - name: imdb_entry_akas_by_title
+          sql: >
+            SELECT
+              a.title_id,
+              a.title,
+              a.region,
+              a.language,
+              a.is_original_title
+            FROM title_akas AS a
+            WHERE
+              a.title ILIKE '%%' || :keyword || '%%'
+            ORDER BY a.is_original_title DESC, a.ordering
+            LIMIT 25;
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+        - name: imdb_entry_akas_by_region
+          sql: >
+            SELECT
+              a.title_id,
+              a.title,
+              a.region,
+              a.language
+            FROM title_akas AS a
+            WHERE
+              a.region ILIKE '%%' || :keyword || '%%'
+            ORDER BY a.ordering
+            LIMIT 20;
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+      system_prompt: |
+        Entry C (AKA / international titles).
+        Use imdb_entry_akas_by_title and imdb_entry_akas_by_region to
+        summarize alternative and international titles related to the
+        search_keyword.
+        Respond ONLY with:
+        {
+          "entry_akas_notes": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+      outputs:
+        - entry_akas_notes
+
+    # ===== 5–6. two hubs (aggregation / fusion) =====
+
+    - id: hub_movie_person_openai20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      db_queries:
+        - name: imdb_hub_movie_person_stats
+          sql: >
+            SELECT
+              COUNT(*) AS movie_count,
+              AVG(r.average_rating) AS avg_rating
+            FROM title_basics AS b
+            LEFT JOIN title_ratings AS r
+              ON r.tconst = b.tconst
+            WHERE
+              b.title_type IN ('movie','tvMovie','tvSeries')
+              AND (
+                b.primary_title ILIKE '%%' || :keyword || '%%'
+                OR b.original_title ILIKE '%%' || :keyword || '%%'
+              );
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+      system_prompt: |
+        Hub1: fuse entry_movie_notes and entry_person_notes into a joint
+        movie-person perspective on the user_query and search_keyword.
+        You may reference simple aggregates from imdb_hub_movie_person_stats.
+        Respond ONLY with:
+        {
+          "hub_movie_person_notes": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+        - entry_movie_notes
+        - entry_person_notes
+      outputs:
+        - hub_movie_person_notes
+
+    - id: hub_full_context_qwen14b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      db_queries:
+        - name: imdb_hub_genre_stats_filtered
+          sql: >
+            SELECT
+              g AS genre,
+              COUNT(*) AS cnt
+            FROM (
+              SELECT
+                regexp_split_to_table(b.genres, ',') AS g
+              FROM title_basics AS b
+              WHERE
+                b.genres IS NOT NULL
+                AND b.genres ILIKE '%%' || :keyword || '%%'
+            ) AS x
+            GROUP BY g
+            ORDER BY cnt DESC
+            LIMIT 10;
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+      system_prompt: |
+        Hub2: combine hub_movie_person_notes with entry_akas_notes into
+        a single full-context view of the candidate space around
+        search_keyword.
+        You may optionally reference imdb_hub_genre_stats_filtered for
+        genre distribution cues.
+        Respond ONLY with:
+        {
+          "hub_full_context": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+        - hub_movie_person_notes
+        - entry_akas_notes
+      outputs:
+        - hub_full_context
+
+    # ===== 7. tail: focused guidance (Model C, 0 DB queries) =====
+
+    - id: tail_focus_qwen32b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+      system_prompt: |
+        Tail: from hub_full_context, produce focused viewing guidance
+        (e.g., what to watch first, how to explore related titles or
+        people) tailored to the user_query.
+        Respond ONLY with:
+        {
+          "tail_focus_notes": "string"
+        }
+      inputs:
+        - user_query
+        - hub_full_context
+      outputs:
+        - tail_focus_notes
+
+    # ===== 8. final answer (Model A, 1 DB query) =====
+
+    - id: imdb_final_answer
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      db_queries:
+        - name: imdb_final_sample_titles
+          sql: >
+            SELECT
+              b.tconst,
+              b.primary_title,
+              b.start_year,
+              r.average_rating,
+              r.num_votes
+            FROM title_basics AS b
+            LEFT JOIN title_ratings AS r
+              ON r.tconst = b.tconst
+            WHERE
+              b.title_type IN ('movie','tvMovie','tvSeries')
+              AND (
+                b.primary_title ILIKE '%%' || :keyword || '%%'
+                OR b.original_title ILIKE '%%' || :keyword || '%%'
+              )
+            ORDER BY COALESCE(r.num_votes, 0) DESC
+            LIMIT 20;
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+      system_prompt: |
+        Final answer assistant.
+        Using user_query, hub_full_context, and tail_focus_notes,
+        produce a clear and concise final_answer that suggests how the
+        user should explore movies and people related to the
+        search_keyword.
+        You may reference imdb_final_sample_titles as generic background
+        but keep the answer grounded in the earlier context.
+        Respond ONLY with:
+        {
+          "final_answer": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+        - hub_full_context
+        - tail_focus_notes
+      outputs:
+        - final_answer
+
+  edges:
+    - from: user_input
+      to: keyword_planner
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: keyword_planner
+      to: entry_movie_qwen14b
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+
+    - from: keyword_planner
+      to: http_entry_movie_by_title
+      mapping:
+        search_keyword: "{{ search_keyword }}"
+
+    - from: keyword_planner
+      to: http_entry_movie_recent
+      mapping:
+        search_keyword: "{{ search_keyword }}"
+
+    - from: keyword_planner
+      to: entry_person_openai20b
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+
+    - from: keyword_planner
+      to: entry_akas_qwen32b
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+
+    - from: entry_movie_qwen14b
+      to: hub_movie_person_openai20b
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+        entry_movie_notes: "{{ entry_movie_notes }}"
+
+    - from: http_entry_movie_by_title
+      to: entry_movie_qwen14b
+      mapping:
+        http_entry_movie_by_title: "{{ http_entry_movie_by_title }}"
+
+    - from: http_entry_movie_recent
+      to: entry_movie_qwen14b
+      mapping:
+        http_entry_movie_recent: "{{ http_entry_movie_recent }}"
+
+    - from: entry_person_openai20b
+      to: hub_movie_person_openai20b
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+        entry_person_notes: "{{ entry_person_notes }}"
+
+    - from: hub_movie_person_openai20b
+      to: hub_full_context_qwen14b
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+        hub_movie_person_notes: "{{ hub_movie_person_notes }}"
+
+    - from: entry_akas_qwen32b
+      to: hub_full_context_qwen14b
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+        entry_akas_notes: "{{ entry_akas_notes }}"
+
+    - from: hub_full_context_qwen14b
+      to: tail_focus_qwen32b
+      mapping:
+        user_query: "{{ user_query }}"
+        hub_full_context: "{{ hub_full_context }}"
+
+    - from: hub_full_context_qwen14b
+      to: imdb_final_answer
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+        hub_full_context: "{{ hub_full_context }}"
+
+    - from: tail_focus_qwen32b
+      to: imdb_final_answer
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+        tail_focus_notes: "{{ tail_focus_notes }}"

@@ -1,0 +1,521 @@
+graph:
+  name: tpch_qbench_interleaved_tablepattern_135_orders_246_lineitem_16q_1_2_1_2_v1
+  description: >
+    Two-layer (Stage1/Stage2) DB-grounded TPC-H workflow.
+    Each layer runs 8 DB queries (total 16), and within each layer the primary table is interleaved:
+      q1,q3,q5 -> orders
+      q2,q4,q6 -> lineitem
+      q7 -> customer
+      q8 -> part
+    LLM order strictly:
+      32B -> 20B -> 20B -> 14B -> 20B -> 20B
+
+  nodes:
+    - id: user_input
+      type: input
+      outputs: [user_query]
+
+    # =========================================================
+    # Deterministic parameter extraction (NO LLM)
+    # =========================================================
+    - id: rule_param_extractor
+      type: processor
+      processor: regex_param_extractor
+      config:
+        enums:
+          region: ["AFRICA","AMERICA","ASIA","EUROPE","MIDDLE EAST"]
+          shipmode: ["AIR","AIR REG","RAIL","SHIP","TRUCK","MAIL","FOB"]
+          segment: ["AUTOMOBILE","BUILDING","FURNITURE","HOUSEHOLD","MACHINERY"]
+        regex:
+          year:
+            - "(?i)\\byear\\s*[=:]\\s*(199[2-8])\\b"
+            - "(?i)\\b(199[2-8])\\b"
+          segment:
+            - "(?i)\\bsegment\\s*[=:]\\s*(AUTOMOBILE|BUILDING|FURNITURE|HOUSEHOLD|MACHINERY)\\b"
+            - "(?i)\\b(AUTOMOBILE|BUILDING|FURNITURE|HOUSEHOLD|MACHINERY)\\b"
+          shipmode:
+            - "(?i)\\bshipmode\\s*[=:]\\s*(AIR\\s+REG|AIR|RAIL|SHIP|TRUCK|MAIL|FOB)\\b"
+            - "(?i)\\b(AIR\\s+REG|AIR|RAIL|SHIP|TRUCK|MAIL|FOB)\\b"
+          shipmode2:
+            - "(?i)\\bshipmode2\\s*[=:]\\s*(AIR\\s+REG|AIR|RAIL|SHIP|TRUCK|MAIL|FOB)\\b"
+          brand:
+            - "(?i)\\bbrand\\s*[=:]\\s*(Brand#[0-9]{2})\\b"
+            - "(?i)\\b(Brand#[0-9]{2})\\b"
+          type:
+            - "(?i)\\btype\\s*[=:]\\s*([A-Za-z0-9_\\- ]{3,30})\\b"
+          size:
+            - "(?i)\\bsize\\s*[=:]\\s*([0-9]{1,3})\\b"
+          qty:
+            - "(?i)\\bqty\\s*[=:]\\s*([0-9]{1,4})\\b"
+            - "(?i)\\bquantity\\s*[=:]\\s*([0-9]{1,4})\\b"
+          discount_lo:
+            - "(?i)\\bdiscount_lo\\s*[=:]\\s*([0-9]*\\.?[0-9]+)\\b"
+          discount_hi:
+            - "(?i)\\bdiscount_hi\\s*[=:]\\s*([0-9]*\\.?[0-9]+)\\b"
+        defaults:
+          year: 1994
+          region: "ASIA"
+          segment: "BUILDING"
+          shipmode: "MAIL"
+          shipmode2: "SHIP"
+          brand: "Brand#13"
+          type: "BRASS"
+          size: 15
+          qty: 24
+          discount_lo: 0.05
+          discount_hi: 0.07
+        normalize:
+          uppercase_fields: ["region","segment","shipmode","shipmode2","brand"]
+          numeric_fields: ["year","size","qty","discount_lo","discount_hi"]
+          strip_quotes: true
+      inputs: [user_query]
+      outputs: [tpch_params]
+
+    # =========================================================
+    # Stage 1: DB(8) + LLM(32B)
+    # Table pattern within Stage1:
+    #   1,3,5: orders
+    #   2,4,6: lineitem
+    #   7: customer
+    #   8: part
+    # =========================================================
+    - id: stage1_db8_llm32b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+      db_queries:
+
+        # (1) orders
+        - name: s1_q1_orders_priority_backlog
+          sql: >
+            SELECT o.o_orderpriority, COUNT(*) AS cnt
+            FROM orders o
+            WHERE o.o_orderdate >= make_date(:year::int, 1, 1)
+              AND o.o_orderdate <  make_date(:year::int, 1, 1) + INTERVAL '3 month'
+              AND EXISTS (
+                SELECT 1 FROM lineitem l
+                WHERE l.l_orderkey = o.o_orderkey
+                  AND l.l_commitdate < l.l_receiptdate
+              )
+            GROUP BY o.o_orderpriority
+            ORDER BY o.o_orderpriority;
+          parameters: { year: "{{ tpch_params.year }}" }
+          param_types: { year: int }
+
+        # (2) lineitem
+        - name: s1_q2_lineitem_returnflag_rollup
+          sql: >
+            SELECT l.l_returnflag, COUNT(*) AS cnt,
+                   SUM(l.l_extendedprice*(1-l.l_discount)) AS rev
+            FROM lineitem l
+            WHERE l.l_shipdate <= make_date(:year::int, 12, 1)
+            GROUP BY l.l_returnflag
+            ORDER BY l.l_returnflag;
+          parameters: { year: "{{ tpch_params.year }}" }
+          param_types: { year: int }
+
+        # (3) orders
+        - name: s1_q3_orders_top_revenue_orders
+          sql: >
+            SELECT o.o_orderkey,
+                   SUM(l.l_extendedprice*(1-l.l_discount)) AS revenue
+            FROM orders o
+            JOIN lineitem l ON l.l_orderkey=o.o_orderkey
+            WHERE o.o_orderdate < make_date(:year::int, 3, 15)
+              AND l.l_shipdate > make_date(:year::int, 3, 15)
+            GROUP BY o.o_orderkey
+            ORDER BY revenue DESC
+            LIMIT 20;
+          parameters: { year: "{{ tpch_params.year }}" }
+          param_types: { year: int }
+
+        # (4) lineitem
+        - name: s1_q4_lineitem_shipmode_priority
+          sql: >
+            SELECT l.l_shipmode,
+                   COUNT(*) FILTER (WHERE o.o_orderpriority IN ('1-URGENT','2-HIGH')) AS high_cnt,
+                   COUNT(*) FILTER (WHERE o.o_orderpriority NOT IN ('1-URGENT','2-HIGH')) AS low_cnt
+            FROM orders o
+            JOIN lineitem l ON l.l_orderkey=o.o_orderkey
+            WHERE l.l_shipmode IN (:shipmode, :shipmode2)
+            GROUP BY l.l_shipmode
+            ORDER BY l.l_shipmode;
+          parameters:
+            shipmode: "{{ tpch_params.shipmode }}"
+            shipmode2: "{{ tpch_params.shipmode2 }}"
+          param_types:
+            shipmode: text
+            shipmode2: text
+
+        # (5) orders
+        - name: s1_q5_orders_returned_revenue_top_customers
+          sql: >
+            SELECT c.c_custkey,
+                   SUM(l.l_extendedprice*(1-l.l_discount)) AS revenue
+            FROM customer c
+            JOIN orders o ON o.o_custkey=c.c_custkey
+            JOIN lineitem l ON l.l_orderkey=o.o_orderkey
+            WHERE l.l_returnflag='R'
+              AND o.o_orderdate >= make_date(:year::int, 1, 1)
+              AND o.o_orderdate <  make_date(:year::int, 1, 1) + INTERVAL '3 month'
+            GROUP BY c.c_custkey
+            ORDER BY revenue DESC
+            LIMIT 20;
+          parameters: { year: "{{ tpch_params.year }}" }
+          param_types: { year: int }
+
+        # (6) lineitem
+        - name: s1_q6_lineitem_discount_band_summary
+          sql: >
+            SELECT
+              COUNT(*) AS cnt,
+              AVG(l_discount) AS avg_disc,
+              SUM(l_extendedprice*(1-l_discount)) AS rev
+            FROM lineitem
+            WHERE l_discount BETWEEN :discount_lo::numeric AND :discount_hi::numeric;
+          parameters:
+            discount_lo: "{{ tpch_params.discount_lo }}"
+            discount_hi: "{{ tpch_params.discount_hi }}"
+          param_types:
+            discount_lo: numeric
+            discount_hi: numeric
+
+        # (7) customer
+        - name: s1_q7_customer_balance_by_phone_prefix
+          sql: >
+            SELECT SUBSTRING(c_phone FROM 1 FOR 2) AS cntrycode,
+                   COUNT(*) FILTER (WHERE c_acctbal>0) AS pos_cnt,
+                   AVG(c_acctbal) FILTER (WHERE c_acctbal>0) AS avg_pos_bal
+            FROM customer
+            GROUP BY cntrycode
+            ORDER BY cntrycode;
+          # no params
+
+        # (8) part
+        - name: s1_q8_part_brand_type_revenue_proxy
+          sql: >
+            SELECT SUM(l.l_extendedprice*(1-l.l_discount)) AS disc_revenue
+            FROM lineitem l
+            JOIN part p ON p.p_partkey=l.l_partkey
+            WHERE p.p_brand=:brand
+              AND p.p_type ILIKE '%' || :type || '%'
+              AND l.l_quantity < :qty::numeric;
+          parameters:
+            brand: "{{ tpch_params.brand }}"
+            type: "{{ tpch_params.type }}"
+            qty: "{{ tpch_params.qty }}"
+          param_types:
+            brand: text
+            type: text
+            qty: numeric
+
+      system_prompt: |
+        Stage-1 combined DB+LLM analyst.
+
+        You receive:
+          - user_query, tpch_params
+          - 8 SQL result sets: s1_q1..s1_q8
+        Table pattern (within stage):
+          q1,q3,q5 -> orders; q2,q4,q6 -> lineitem; q7 -> customer; q8 -> part.
+
+        Task:
+          1) Extract key metrics/anomalies (numeric when possible).
+          2) Decide dominant driver: ops|demand|pricing|customer|supply|mixed.
+          3) Produce 2-4 testable hypotheses for Stage-2 validation.
+             Each hypothesis must cite s1_qX AND name which s2_qX would validate it.
+
+        Output JSON only:
+        {
+          "stage1_brief": "string",
+          "dominant_driver": "ops|demand|pricing|customer|supply|mixed",
+          "hypotheses": [
+            {"id":"H1","claim":"string","evidence":["s1_qX"],"stage2_targets":["s2_qX"]}
+          ]
+        }
+      inputs: [user_query, tpch_params]
+      outputs: [stage1_brief, dominant_driver, hypotheses]
+
+    # =========================================================
+    # Stage1 parallel reviewers: (20B + 20B), NO DB
+    # =========================================================
+    - id: stage1_parallel_ops_20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        Ops-focused reviewer.
+        Use ONLY stage1_brief + hypotheses (do not invent DB facts).
+        Output JSON only:
+        { "ops_view": "string", "stage2_focus": ["s2_qX", "..."] }
+      inputs: [stage1_brief, hypotheses]
+      outputs: [ops_view, ops_stage2_focus]
+
+    - id: stage1_parallel_demand_20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        Demand/pricing-focused reviewer.
+        Use ONLY stage1_brief + hypotheses (do not invent DB facts).
+        Output JSON only:
+        { "demand_view": "string", "stage2_focus": ["s2_qX", "..."] }
+      inputs: [stage1_brief, hypotheses]
+      outputs: [demand_view, demand_stage2_focus]
+
+    # =========================================================
+    # Stage 2: DB(8) + LLM(14B)  (total DB queries now 16 across workflow)
+    # Same table pattern within Stage2:
+    #   1,3,5: orders
+    #   2,4,6: lineitem
+    #   7: customer
+    #   8: part
+    # =========================================================
+    - id: stage2_db8_llm14b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      db_queries:
+
+        # (1) orders
+        - name: s2_q1_orders_revenue_by_region
+          sql: >
+            SELECT r.r_name AS region,
+                   SUM(l.l_extendedprice*(1-l.l_discount)) AS revenue
+            FROM orders o
+            JOIN customer c ON c.c_custkey=o.o_custkey
+            JOIN nation n ON n.n_nationkey=c.c_nationkey
+            JOIN region r ON r.r_regionkey=n.n_regionkey
+            JOIN lineitem l ON l.l_orderkey=o.o_orderkey
+            WHERE o.o_orderdate >= make_date(:year::int, 1, 1)
+              AND o.o_orderdate <  make_date(:year::int, 1, 1) + INTERVAL '1 year'
+            GROUP BY r.r_name
+            ORDER BY revenue DESC;
+          parameters: { year: "{{ tpch_params.year }}" }
+          param_types: { year: int }
+
+        # (2) lineitem
+        - name: s2_q2_lineitem_late_lines_pressure
+          sql: >
+            SELECT COUNT(*) AS late_lines
+            FROM lineitem
+            WHERE l_receiptdate > l_commitdate;
+          # no params
+
+        # (3) orders
+        - name: s2_q3_orders_large_orders_by_qty
+          sql: >
+            SELECT o.o_orderkey, SUM(l.l_quantity) AS sum_qty
+            FROM orders o
+            JOIN lineitem l ON l.l_orderkey=o.o_orderkey
+            WHERE o.o_orderdate >= make_date(:year::int, 1, 1)
+              AND o.o_orderdate <  make_date(:year::int, 1, 1) + INTERVAL '1 year'
+            GROUP BY o.o_orderkey
+            HAVING SUM(l.l_quantity) > :qty::numeric
+            ORDER BY sum_qty DESC
+            LIMIT 20;
+          parameters:
+            year: "{{ tpch_params.year }}"
+            qty: "{{ tpch_params.qty }}"
+          param_types:
+            year: int
+            qty: numeric
+
+        # (4) lineitem
+        - name: s2_q4_lineitem_promo_revenue_ratio
+          sql: >
+            SELECT
+              100.0 * SUM(CASE WHEN p.p_type LIKE 'PROMO%' THEN l.l_extendedprice*(1-l.l_discount) ELSE 0 END)
+              / NULLIF(SUM(l.l_extendedprice*(1-l.l_discount)), 0) AS promo_revenue_pct
+            FROM lineitem l
+            JOIN part p ON p.p_partkey=l.l_partkey
+            WHERE l.l_shipdate >= make_date(:year::int, 9, 1)
+              AND l.l_shipdate <  make_date(:year::int, 10, 1);
+          parameters: { year: "{{ tpch_params.year }}" }
+          param_types: { year: int }
+
+        # (5) orders
+        - name: s2_q5_orders_trade_flow_top_pairs
+          sql: >
+            SELECT
+              supp_n.n_name AS supp_nation,
+              cust_n.n_name AS cust_nation,
+              EXTRACT(YEAR FROM l.l_shipdate)::int AS ship_year,
+              SUM(l.l_extendedprice*(1-l.l_discount)) AS revenue
+            FROM orders o
+            JOIN customer c ON c.c_custkey=o.o_custkey
+            JOIN nation cust_n ON cust_n.n_nationkey=c.c_nationkey
+            JOIN lineitem l ON l.l_orderkey=o.o_orderkey
+            JOIN supplier s ON s.s_suppkey=l.l_suppkey
+            JOIN nation supp_n ON supp_n.n_nationkey=s.s_nationkey
+            WHERE l.l_shipdate >= make_date(:year::int, 1, 1)
+              AND l.l_shipdate <  make_date(:year::int, 1, 1) + INTERVAL '2 year'
+            GROUP BY supp_n.n_name, cust_n.n_name, ship_year
+            ORDER BY revenue DESC
+            LIMIT 30;
+          parameters: { year: "{{ tpch_params.year }}" }
+          param_types: { year: int }
+
+        # (6) lineitem
+        - name: s2_q6_lineitem_shipmode_priority_split
+          sql: >
+            SELECT l.l_shipmode,
+                   COUNT(*) FILTER (WHERE o.o_orderpriority IN ('1-URGENT','2-HIGH')) AS high_cnt,
+                   COUNT(*) FILTER (WHERE o.o_orderpriority NOT IN ('1-URGENT','2-HIGH')) AS low_cnt
+            FROM orders o
+            JOIN lineitem l ON l.l_orderkey=o.o_orderkey
+            WHERE l.l_shipmode IN (:shipmode, :shipmode2)
+              AND l.l_receiptdate >= make_date(:year::int, 1, 1)
+              AND l.l_receiptdate <  make_date(:year::int, 1, 1) + INTERVAL '1 year'
+            GROUP BY l.l_shipmode
+            ORDER BY l.l_shipmode;
+          parameters:
+            shipmode: "{{ tpch_params.shipmode }}"
+            shipmode2: "{{ tpch_params.shipmode2 }}"
+            year: "{{ tpch_params.year }}"
+          param_types:
+            shipmode: text
+            shipmode2: text
+            year: int
+
+        # (7) customer
+        - name: s2_q7_customer_above_avg_pos_balance
+          sql: >
+            WITH base AS (
+              SELECT c_acctbal AS bal FROM customer WHERE c_acctbal > 0
+            ),
+            avg_pos AS (SELECT AVG(bal) AS avg_bal FROM base)
+            SELECT
+              COUNT(*) FILTER (WHERE c.c_acctbal > ap.avg_bal) AS num_cust,
+              SUM(c.c_acctbal) FILTER (WHERE c.c_acctbal > ap.avg_bal) AS tot_acctbal
+            FROM customer c
+            CROSS JOIN avg_pos ap;
+          # no params
+
+        # (8) part
+        - name: s2_q8_part_brand_discount_band_revenue
+          sql: >
+            SELECT SUM(l.l_extendedprice*(1-l.l_discount)) AS disc_revenue
+            FROM lineitem l
+            JOIN part p ON p.p_partkey=l.l_partkey
+            WHERE p.p_brand=:brand
+              AND l.l_discount BETWEEN :discount_lo::numeric AND :discount_hi::numeric
+              AND l.l_quantity < :qty::numeric;
+          parameters:
+            brand: "{{ tpch_params.brand }}"
+            discount_lo: "{{ tpch_params.discount_lo }}"
+            discount_hi: "{{ tpch_params.discount_hi }}"
+            qty: "{{ tpch_params.qty }}"
+          param_types:
+            brand: text
+            discount_lo: numeric
+            discount_hi: numeric
+            qty: numeric
+
+      system_prompt: |
+        Stage-2 validator (DB-grounded).
+
+        You receive:
+          - user_query, tpch_params
+          - stage1_brief, hypotheses, ops_view, demand_view (+focus lists)
+          - 8 SQL result sets: s2_q1..s2_q8
+        Table pattern (within stage):
+          q1,q3,q5 -> orders; q2,q4,q6 -> lineitem; q7 -> customer; q8 -> part.
+
+        Task:
+          1) Validate/refute each hypothesis with explicit citations (s2_qX).
+          2) Resolve ops_view vs demand_view disagreements explicitly.
+          3) Produce a concise stage2_brief for final writers.
+
+        Output JSON only:
+        {
+          "stage2_brief": "string",
+          "hypothesis_verdicts": [
+            {"id":"H1","verdict":"confirmed|refuted|inconclusive","evidence":["s2_qX"],"explanation":"string"}
+          ]
+        }
+      inputs:
+        [user_query, tpch_params, stage1_brief, hypotheses, ops_view, demand_view, ops_stage2_focus, demand_stage2_focus]
+      outputs: [stage2_brief, hypothesis_verdicts]
+
+    # =========================================================
+    # Final parallel writers: (20B + 20B), NO DB
+    # =========================================================
+    - id: stage2_parallel_final_20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        Write the final user-facing answer.
+        Use ONLY stage2_brief + hypothesis_verdicts (no new facts).
+        Reference evidence by query name when summarizing key points.
+        Output JSON only: { "final_answer": "string" }
+      inputs: [stage2_brief, hypothesis_verdicts]
+      outputs: [final_answer]
+
+    - id: stage2_parallel_nextsteps_20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        Propose next actions:
+          - 3 parameter refinements (what to change and why)
+          - 3 follow-up TPC-H Q# queries and rationale
+        Use ONLY stage2_brief + hypothesis_verdicts.
+        Output JSON only: { "next_steps": "string" }
+      inputs: [stage2_brief, hypothesis_verdicts]
+      outputs: [next_steps]
+
+  edges:
+    - from: user_input
+      to: rule_param_extractor
+      mapping: { user_query: "{{ user_query }}" }
+
+    - from: rule_param_extractor
+      to: stage1_db8_llm32b
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+
+    - from: stage1_db8_llm32b
+      to: stage1_parallel_ops_20b
+      mapping:
+        stage1_brief: "{{ stage1_brief }}"
+        hypotheses: "{{ hypotheses }}"
+
+    - from: stage1_db8_llm32b
+      to: stage1_parallel_demand_20b
+      mapping:
+        stage1_brief: "{{ stage1_brief }}"
+        hypotheses: "{{ hypotheses }}"
+
+    - from: stage1_parallel_ops_20b
+      to: stage2_db8_llm14b
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+        stage1_brief: "{{ stage1_brief }}"
+        hypotheses: "{{ hypotheses }}"
+        ops_view: "{{ ops_view }}"
+        ops_stage2_focus: "{{ ops_stage2_focus }}"
+
+    - from: stage1_parallel_demand_20b
+      to: stage2_db8_llm14b
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+        stage1_brief: "{{ stage1_brief }}"
+        hypotheses: "{{ hypotheses }}"
+        demand_view: "{{ demand_view }}"
+        demand_stage2_focus: "{{ demand_stage2_focus }}"
+
+    - from: stage2_db8_llm14b
+      to: stage2_parallel_final_20b
+      mapping:
+        stage2_brief: "{{ stage2_brief }}"
+        hypothesis_verdicts: "{{ hypothesis_verdicts }}"
+
+    - from: stage2_db8_llm14b
+      to: stage2_parallel_nextsteps_20b
+      mapping:
+        stage2_brief: "{{ stage2_brief }}"
+        hypothesis_verdicts: "{{ hypothesis_verdicts }}"

@@ -1,0 +1,441 @@
+graph:
+  name: tpch_qbench_trident_rules_http_v1
+  description: >
+    TPC-H Q1–Q22-aligned workflow with RULE-BASED parameter extraction.
+    No LLM parameter parsing.
+    A deterministic rule node extracts structured parameters from user_query
+    using regex + dictionaries, then downstream DB nodes use those parameters
+    in Q1–Q22-style queries.
+    HTTP stand-ins replace the DB queries across the trident workflow.
+
+  nodes:
+    - id: user_input
+      type: input
+      outputs:
+        - user_query
+
+    # ===== 1) deterministic param extraction (NO LLM) =====
+    - id: rule_param_extractor
+      type: processor
+      processor: regex_param_extractor
+      config:
+        # ---- Dictionaries for canonicalization (case-insensitive) ----
+        enums:
+          region: ["AFRICA","AMERICA","ASIA","EUROPE","MIDDLE EAST"]
+          segment: ["AUTOMOBILE","BUILDING","FURNITURE","HOUSEHOLD","MACHINERY"]
+          shipmode: ["AIR","AIR REG","RAIL","SHIP","TRUCK","MAIL","FOB"]
+          orderpriority_prefix: ["1-URGENT","2-HIGH","3-MEDIUM","4-NOT SPECIFIED","5-LOW"]
+
+        # ---- Regex rules (first match wins per field unless allow_multi) ----
+        regex:
+          # dates: accept YYYY-MM-DD or YYYY/MM/DD
+          date:
+            - "(?i)\\bdate\\s*[=:]\\s*([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})\\b"
+            - "(?i)\\bafter\\s+([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})\\b"
+            - "(?i)\\bbefore\\s+([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})\\b"
+          date2:
+            - "(?i)\\bdate2\\s*[=:]\\s*([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})\\b"
+            - "(?i)\\bto\\s+([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})\\b"
+
+          # years
+          year:
+            - "(?i)\\byear\\s*[=:]\\s*(199[2-8])\\b"
+            - "(?i)\\b(199[2-8])\\b"
+          year2:
+            - "(?i)\\byear2\\s*[=:]\\s*(199[2-8])\\b"
+            - "(?i)\\bbetween\\s+(199[2-8])\\s+and\\s+(199[2-8])\\b"  # you can map to year/year2 in code
+
+          # region / nation / segment
+          region:
+            - "(?i)\\bregion\\s*[=:]\\s*([A-Z][A-Z ]+?)\\b"
+            - "(?i)\\b(AF(RICA)?|AMERICA|ASIA|EUROPE|MIDDLE\\s+EAST)\\b"
+          nation:
+            - "(?i)\\bnation\\s*[=:]\\s*([A-Z][A-Z ]+?)\\b"
+            - "(?i)\\b(JAPAN|CHINA|INDIA|FRANCE|GERMANY|CANADA|BRAZIL|UNITED\\s+STATES|RUSSIA)\\b"
+          nation2:
+            - "(?i)\\bnation2\\s*[=:]\\s*([A-Z][A-Z ]+?)\\b"
+            - "(?i)\\bvs\\s+([A-Z][A-Z ]+?)\\b"
+
+          segment:
+            - "(?i)\\bsegment\\s*[=:]\\s*(AUTOMOBILE|BUILDING|FURNITURE|HOUSEHOLD|MACHINERY)\\b"
+            - "(?i)\\b(AUTOMOBILE|BUILDING|FURNITURE|HOUSEHOLD|MACHINERY)\\b"
+
+          # part filters
+          brand:
+            - "(?i)\\bbrand\\s*[=:]\\s*(Brand#[0-9]{2})\\b"
+            - "(?i)\\b(Brand#[0-9]{2})\\b"
+          type:
+            - "(?i)\\btype\\s*[=:]\\s*([A-Za-z0-9_\\- ]{3,30})\\b"
+          size:
+            - "(?i)\\bsize\\s*[=:]\\s*([0-9]{1,3})\\b"
+
+          # ops filters
+          shipmode:
+            - "(?i)\\bshipmode\\s*[=:]\\s*(AIR\\s+REG|AIR|RAIL|SHIP|TRUCK|MAIL|FOB)\\b"
+            - "(?i)\\b(AIR\\s+REG|AIR|RAIL|SHIP|TRUCK|MAIL|FOB)\\b"
+          shipmode2:
+            - "(?i)\\bshipmode2\\s*[=:]\\s*(AIR\\s+REG|AIR|RAIL|SHIP|TRUCK|MAIL|FOB)\\b"
+          discount_lo:
+            - "(?i)\\bdiscount\\s*[=:]\\s*([0-9]*\\.?[0-9]+)\\b"     # "discount=0.05" -> lo
+            - "(?i)\\bdiscount_lo\\s*[=:]\\s*([0-9]*\\.?[0-9]+)\\b"
+          discount_hi:
+            - "(?i)\\bdiscount_hi\\s*[=:]\\s*([0-9]*\\.?[0-9]+)\\b"
+          qty:
+            - "(?i)\\bqty\\s*[<=>:]\\s*([0-9]{1,4})\\b"
+            - "(?i)\\bquantity\\s*[<=>:]\\s*([0-9]{1,4})\\b"
+
+        # ---- Defaults (TPC-H-ish) ----
+        defaults:
+          year: 1994
+          region: "ASIA"
+          segment: "BUILDING"
+          shipmode: "MAIL"
+          shipmode2: "SHIP"
+          date: "1995-03-15"
+          discount_lo: 0.05
+          discount_hi: 0.07
+          qty: 24
+          size: 15
+          type: "BRASS"
+          brand: "Brand#13"
+          nation: "CANADA"
+          nation2: "GERMANY"
+
+        # ---- Normalizers (implemented in your processor) ----
+        normalize:
+          uppercase_fields: ["region","nation","nation2","segment","shipmode","shipmode2","brand"]
+          date_fields: ["date","date2"]
+          numeric_fields: ["year","year2","size","qty","discount_lo","discount_hi"]
+          strip_quotes: true
+      inputs:
+        - user_query
+      outputs:
+        - tpch_params
+
+    # ===== HTTP stand-ins for TPC-H queries =====
+    - id: http_tpch_q1_pricing_summary
+      type: http
+      engine: http
+      sleep_s: 2
+      inputs:
+        - tpch_params
+      outputs:
+        - http_tpch_q1_pricing_summary
+
+    - id: http_tpch_q6_revenue_change
+      type: http
+      engine: http
+      sleep_s: 2
+      inputs:
+        - tpch_params
+      outputs:
+        - http_tpch_q6_revenue_change
+
+    - id: http_tpch_q3_shipping_priority
+      type: http
+      engine: http
+      sleep_s: 2
+      inputs:
+        - tpch_params
+      outputs:
+        - http_tpch_q3_shipping_priority
+
+    - id: http_tpch_q5_local_supplier_volume
+      type: http
+      engine: http
+      sleep_s: 2
+      inputs:
+        - tpch_params
+      outputs:
+        - http_tpch_q5_local_supplier_volume
+
+    - id: http_tpch_q2_min_cost_supplier
+      type: http
+      engine: http
+      sleep_s: 2
+      inputs:
+        - tpch_params
+      outputs:
+        - http_tpch_q2_min_cost_supplier
+
+    - id: http_tpch_q9_profit
+      type: http
+      engine: http
+      sleep_s: 2
+      inputs:
+        - tpch_params
+      outputs:
+        - http_tpch_q9_profit
+
+    - id: http_tpch_q12_shipmode_priority
+      type: http
+      engine: http
+      sleep_s: 2
+      inputs:
+        - tpch_params
+      outputs:
+        - http_tpch_q12_shipmode_priority
+
+    - id: http_tpch_q14_promo_revenue
+      type: http
+      engine: http
+      sleep_s: 2
+      inputs:
+        - tpch_params
+      outputs:
+        - http_tpch_q14_promo_revenue
+
+    - id: http_tpch_q15_top_supplier
+      type: http
+      engine: http
+      sleep_s: 2
+      inputs:
+        - tpch_params
+      outputs:
+        - http_tpch_q15_top_supplier
+
+    # ===== 2–4) entry fan-out =====
+
+    - id: entry_q1_q6_lineitem
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        Entry A: Summarize Q1 + Q6 outputs and connect them to user_query.
+        Use http_tpch_q1_pricing_summary and http_tpch_q6_revenue_change.
+        Respond ONLY with: { "entry_lineitem_notes": "string" }
+      inputs: [user_query, tpch_params, http_tpch_q1_pricing_summary, http_tpch_q6_revenue_change]
+      outputs: [entry_lineitem_notes]
+
+    - id: entry_q3_q5_revenue
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        Entry B: Summarize Q3 + Q5 outputs and connect them to user_query.
+        Use http_tpch_q3_shipping_priority and http_tpch_q5_local_supplier_volume.
+        Respond ONLY with: { "entry_revenue_notes": "string" }
+      inputs: [user_query, tpch_params, http_tpch_q3_shipping_priority, http_tpch_q5_local_supplier_volume]
+      outputs: [entry_revenue_notes]
+
+    - id: entry_q2_q9_supply
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+      system_prompt: |
+        Entry C: Summarize Q2 + Q9 outputs and connect them to user_query.
+        Use http_tpch_q2_min_cost_supplier and http_tpch_q9_profit.
+        Respond ONLY with: { "entry_supply_notes": "string" }
+      inputs: [user_query, tpch_params, http_tpch_q2_min_cost_supplier, http_tpch_q9_profit]
+      outputs: [entry_supply_notes]
+
+    # ===== 5–6) hubs =====
+
+    - id: hub_ops_openai20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        Hub1: fuse entry_lineitem_notes + entry_revenue_notes with Q12 anchor.
+        Use http_tpch_q12_shipmode_priority.
+        Respond ONLY with: { "hub_ops_notes": "string" }
+      inputs: [user_query, tpch_params, entry_lineitem_notes, entry_revenue_notes, http_tpch_q12_shipmode_priority]
+      outputs: [hub_ops_notes]
+
+    - id: hub_full_context_qwen14b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        Hub2: combine hub_ops_notes + entry_supply_notes with Q14 promo anchor.
+        Use http_tpch_q14_promo_revenue.
+        Respond ONLY with: { "hub_full_context": "string" }
+      inputs: [user_query, tpch_params, hub_ops_notes, entry_supply_notes, http_tpch_q14_promo_revenue]
+      outputs: [hub_full_context]
+
+    # ===== 7) tail =====
+    - id: tail_focus_qwen32b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+      system_prompt: |
+        Tail: based on hub_full_context, recommend 4–6 next TPC-H queries to run
+        and which params to refine (year/date/region/nation/segment/brand/shipmode/discount/qty/size/type).
+        Respond ONLY with: { "tail_focus_notes": "string" }
+      inputs: [user_query, hub_full_context]
+      outputs: [tail_focus_notes]
+
+    # ===== 8) final =====
+    - id: tpch_final_answer
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        Final: use tpch_params + hub_full_context + tail_focus_notes + Q15 output
+        from http_tpch_q15_top_supplier
+        to produce final_answer grounded in the DB results.
+        Respond ONLY with: { "final_answer": "string" }
+      inputs: [user_query, tpch_params, hub_full_context, tail_focus_notes, http_tpch_q15_top_supplier]
+      outputs: [final_answer]
+
+  edges:
+    - from: user_input
+      to: rule_param_extractor
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: rule_param_extractor
+      to: http_tpch_q1_pricing_summary
+      mapping:
+        tpch_params: "{{ tpch_params }}"
+
+    - from: rule_param_extractor
+      to: http_tpch_q6_revenue_change
+      mapping:
+        tpch_params: "{{ tpch_params }}"
+
+    - from: rule_param_extractor
+      to: http_tpch_q3_shipping_priority
+      mapping:
+        tpch_params: "{{ tpch_params }}"
+
+    - from: rule_param_extractor
+      to: http_tpch_q5_local_supplier_volume
+      mapping:
+        tpch_params: "{{ tpch_params }}"
+
+    - from: rule_param_extractor
+      to: http_tpch_q2_min_cost_supplier
+      mapping:
+        tpch_params: "{{ tpch_params }}"
+
+    - from: rule_param_extractor
+      to: http_tpch_q9_profit
+      mapping:
+        tpch_params: "{{ tpch_params }}"
+
+    - from: rule_param_extractor
+      to: http_tpch_q12_shipmode_priority
+      mapping:
+        tpch_params: "{{ tpch_params }}"
+
+    - from: rule_param_extractor
+      to: http_tpch_q14_promo_revenue
+      mapping:
+        tpch_params: "{{ tpch_params }}"
+
+    - from: rule_param_extractor
+      to: http_tpch_q15_top_supplier
+      mapping:
+        tpch_params: "{{ tpch_params }}"
+
+    - from: rule_param_extractor
+      to: entry_q1_q6_lineitem
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+
+    - from: http_tpch_q1_pricing_summary
+      to: entry_q1_q6_lineitem
+      mapping:
+        http_tpch_q1_pricing_summary: "{{ http_tpch_q1_pricing_summary }}"
+
+    - from: http_tpch_q6_revenue_change
+      to: entry_q1_q6_lineitem
+      mapping:
+        http_tpch_q6_revenue_change: "{{ http_tpch_q6_revenue_change }}"
+
+    - from: rule_param_extractor
+      to: entry_q3_q5_revenue
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+
+    - from: http_tpch_q3_shipping_priority
+      to: entry_q3_q5_revenue
+      mapping:
+        http_tpch_q3_shipping_priority: "{{ http_tpch_q3_shipping_priority }}"
+
+    - from: http_tpch_q5_local_supplier_volume
+      to: entry_q3_q5_revenue
+      mapping:
+        http_tpch_q5_local_supplier_volume: "{{ http_tpch_q5_local_supplier_volume }}"
+
+    - from: rule_param_extractor
+      to: entry_q2_q9_supply
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+
+    - from: http_tpch_q2_min_cost_supplier
+      to: entry_q2_q9_supply
+      mapping:
+        http_tpch_q2_min_cost_supplier: "{{ http_tpch_q2_min_cost_supplier }}"
+
+    - from: http_tpch_q9_profit
+      to: entry_q2_q9_supply
+      mapping:
+        http_tpch_q9_profit: "{{ http_tpch_q9_profit }}"
+
+    - from: entry_q1_q6_lineitem
+      to: hub_ops_openai20b
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+        entry_lineitem_notes: "{{ entry_lineitem_notes }}"
+
+    - from: entry_q3_q5_revenue
+      to: hub_ops_openai20b
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+        entry_revenue_notes: "{{ entry_revenue_notes }}"
+
+    - from: http_tpch_q12_shipmode_priority
+      to: hub_ops_openai20b
+      mapping:
+        http_tpch_q12_shipmode_priority: "{{ http_tpch_q12_shipmode_priority }}"
+
+    - from: hub_ops_openai20b
+      to: hub_full_context_qwen14b
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+        hub_ops_notes: "{{ hub_ops_notes }}"
+
+    - from: entry_q2_q9_supply
+      to: hub_full_context_qwen14b
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+        entry_supply_notes: "{{ entry_supply_notes }}"
+
+    - from: http_tpch_q14_promo_revenue
+      to: hub_full_context_qwen14b
+      mapping:
+        http_tpch_q14_promo_revenue: "{{ http_tpch_q14_promo_revenue }}"
+
+    - from: hub_full_context_qwen14b
+      to: tail_focus_qwen32b
+      mapping:
+        user_query: "{{ user_query }}"
+        hub_full_context: "{{ hub_full_context }}"
+
+    - from: hub_full_context_qwen14b
+      to: tpch_final_answer
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+        hub_full_context: "{{ hub_full_context }}"
+
+    - from: tail_focus_qwen32b
+      to: tpch_final_answer
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+        tail_focus_notes: "{{ tail_focus_notes }}"
+
+    - from: http_tpch_q15_top_supplier
+      to: tpch_final_answer
+      mapping:
+        http_tpch_q15_top_supplier: "{{ http_tpch_q15_top_supplier }}"

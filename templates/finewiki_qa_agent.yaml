@@ -1,0 +1,247 @@
+graph:
+  name: finewiki_qa_agent_3stage
+  description: >
+    A 3-stage inference workflow over the HuggingFaceFW/finewiki
+    PostgreSQL database. Stage 1 performs multi-view retrieval,
+    Stage 2 refines and structures knowledge, and Stage 3 produces
+    a final answer and writes it back to the DB.
+
+  nodes:
+    - id: user_input
+      type: input
+      outputs:
+        - user_query
+
+    # ===== Stage 1: 多视角检索 + 初步summary =====
+    - id: stage1_multi_retrieval
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      db_queries:
+        - name: search_wikitext_fulltext
+          sql: >
+            SELECT page_id, title, url, wikitext
+            FROM pages
+            WHERE in_language = 'en'
+              AND to_tsvector('english', coalesce(wikitext, ''))
+                  @@ plainto_tsquery('english', :keyword)
+            ORDER BY date_modified DESC
+            LIMIT 20;
+          parameters:
+            keyword: "{{ user_query }}"
+
+        - name: search_title_fulltext
+          sql: >
+            SELECT page_id, title, url, wikitext
+            FROM pages
+            WHERE in_language = 'en'
+              AND to_tsvector('english', title) @@ plainto_tsquery('english', :keyword)
+            ORDER BY date_modified DESC
+            LIMIT 15;
+          parameters:
+            keyword: "{{ user_query }}"
+
+        - name: search_exact_title_like
+          sql: >
+            SELECT page_id, title, url, wikitext
+            FROM pages
+            WHERE in_language = 'en'
+              AND LOWER(title) LIKE LOWER(:title_pattern)
+            ORDER BY date_modified DESC
+            LIMIT 10;
+          parameters:
+            title_pattern: "%{{ user_query }}%"
+
+        - name: search_recent_highlight
+          sql: >
+            SELECT page_id, title, url, wikitext
+            FROM pages
+            WHERE in_language = 'en'
+              AND to_tsvector('english', coalesce(wikitext, ''))
+                  @@ plainto_tsquery('english', :keyword)
+              AND date_modified IS NOT NULL
+            ORDER BY date_modified DESC
+            LIMIT 5;
+          parameters:
+            keyword: "{{ user_query }}"
+      system_prompt: |
+        You are a retrieval and summarization assistant.
+        You will receive multiple result sets from different SQL queries over a Wikipedia-like corpus.
+        1. Merge and deduplicate the retrieved pages logically (based on title/page_id).
+        2. Identify the most relevant pages for answering the user query.
+        3. Produce a concise "coarse summary" that captures the key entities, dates, and relationships.
+        4. Also list a small set of candidate page_ids that seem most central to the query.
+
+        Respond ONLY with valid JSON matching this schema:
+        {
+          "coarse_summary": "string",
+          "candidate_page_ids": [integer, ...]
+        }
+      inputs:
+        - user_query
+      outputs:
+        - coarse_summary
+        - candidate_page_ids
+
+    # ===== Stage 2: 基于候选页面做精细整理 + 支持性事实 =====
+    - id: stage2_refine_and_structure
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      db_queries:
+        - name: fetch_candidate_pages
+          sql: >
+            SELECT page_id, title, url, wikitext
+            FROM pages
+            WHERE page_id = ANY(:candidate_ids)
+            ORDER BY page_id ASC;
+          parameters:
+            candidate_ids: "{{ candidate_page_ids }}"
+
+        - name: fetch_related_by_title_prefix
+          sql: >
+            SELECT page_id, title, url, wikitext
+            FROM pages
+            WHERE in_language = 'en'
+              AND EXISTS (
+                SELECT 1
+                FROM pages p2
+                WHERE p2.page_id = ANY(:candidate_ids)
+                  AND LOWER(pages.title) LIKE LOWER(p2.title || '%%')
+              )
+            LIMIT 20;
+          parameters:
+            candidate_ids: "{{ candidate_page_ids }}"
+
+        - name: fetch_recent_updates_of_candidates
+          sql: >
+            SELECT page_id, title, url, wikitext, date_modified
+            FROM pages
+            WHERE page_id = ANY(:candidate_ids)
+              AND date_modified IS NOT NULL
+            ORDER BY date_modified DESC
+            LIMIT 20;
+          parameters:
+            candidate_ids: "{{ candidate_page_ids }}"
+
+        - name: fetch_language_variants
+          sql: >
+            SELECT page_id, title, url, wikitext, in_language
+            FROM pages
+            WHERE page_id = ANY(:candidate_ids)
+              AND in_language <> 'en'
+            LIMIT 20;
+          parameters:
+            candidate_ids: "{{ candidate_page_ids }}"
+      system_prompt: |
+        You are an expert knowledge distillation assistant.
+        You will receive several sets of pages related to previously selected candidate page_ids.
+        Your tasks:
+        1. Read all provided content and build a refined, structured summary focusing on facts
+           that directly help to answer the user's query.
+        2. Extract a small list of "supporting facts" (bullet points) with titles and short factual statements.
+        3. Optionally adjust the candidate_page_ids by re-ranking or filtering them
+           (e.g., drop clearly irrelevant pages).
+
+        Respond ONLY with valid JSON matching this schema:
+        {
+          "refined_summary": "string",
+          "supporting_facts": [{"title": "string", "fact": "string"}, ...],
+          "selected_page_ids": [integer, ...]
+        }
+      inputs:
+        - user_query
+        - coarse_summary
+        - candidate_page_ids
+      outputs:
+        - refined_summary
+        - supporting_facts
+        - selected_page_ids
+
+    # ===== Stage 3: 最终回答 + 写回数据库 =====
+    - id: stage3_answer_and_writeback
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      db_queries:
+        - name: insert_final_answer
+          sql: >
+            INSERT INTO finewiki_answers (question, wiki_summary, final_answer)
+            VALUES (:question, :wiki_summary, :final_answer)
+            RETURNING id;
+          parameters:
+            question: "{{ user_query }}"
+            wiki_summary: "{{ refined_summary }}"
+            final_answer: "{{ final_answer }}"
+          post_llm: true
+          result_mappings:
+            answer_id: rows.0.id
+
+        - name: select_inserted_answer
+          sql: >
+            SELECT id, question, wiki_summary, final_answer, created_at
+            FROM finewiki_answers
+            WHERE id = :answer_id;
+          parameters:
+            answer_id: "{{ answer_id }}"
+          post_llm: true
+
+        - name: count_answers_for_question
+          sql: >
+            SELECT COUNT(*) AS answer_count
+            FROM finewiki_answers
+            WHERE question = :question;
+          parameters:
+            question: "{{ user_query }}"
+          post_llm: true
+
+        - name: recent_answers_preview
+          sql: >
+            SELECT id, question, created_at
+            FROM finewiki_answers
+            ORDER BY created_at DESC
+            LIMIT 20;
+          parameters: {}
+          post_llm: true
+      system_prompt: |
+        You are a final-answer assistant.
+        Using the refined summary and supporting facts, produce a clear, well-structured,
+        and user-friendly final answer to the query. Explicitly mention uncertainty when needed.
+
+        After generating the final answer, the system will store it in the finewiki_answers table.
+        You will receive back the inserted answer_id and may get some metadata about previous answers.
+
+        Respond ONLY with valid JSON matching this schema:
+        {
+          "final_answer": "string",
+          "answer_id": integer
+        }
+      inputs:
+        - user_query
+        - refined_summary
+        - supporting_facts
+        - selected_page_ids
+      outputs:
+        - final_answer
+        - answer_id
+
+  edges:
+    - from: user_input
+      to: stage1_multi_retrieval
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: stage1_multi_retrieval
+      to: stage2_refine_and_structure
+      mapping:
+        user_query: "{{ user_query }}"
+        coarse_summary: "{{ coarse_summary }}"
+        candidate_page_ids: "{{ candidate_page_ids }}"
+
+    - from: stage2_refine_and_structure
+      to: stage3_answer_and_writeback
+      mapping:
+        user_query: "{{ user_query }}"
+        refined_summary: "{{ refined_summary }}"
+        supporting_facts: "{{ supporting_facts }}"
+        selected_page_ids: "{{ selected_page_ids }}"

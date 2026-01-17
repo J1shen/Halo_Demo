@@ -1,0 +1,366 @@
+graph:
+  name: tpcc_payment_parallel_join_v1
+  description: >
+    TPC-C Payment transaction (BenchmarkSQL style, useStoredProcedures=false)
+    with a parallel topology:
+    - Branch A: read-only context fetch + LLM summarization
+    - Branch B: write path updates + history insert
+    - Join: final LLM combines and sanity-checks effects
+
+  nodes:
+    - id: user_input
+      type: input
+      outputs:
+        - user_query
+
+    # ===== 1) parameter planner (LLM-only, Model A) =====
+    - id: tpcc_payment_param_planner_openai20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        You are the TPC-C parameter planner for a SINGLE Payment transaction.
+
+        Produce concrete parameters that make SQL runnable.
+        Typical constraints:
+        - w_id in [1, warehouses], d_id in [1,10]
+        - customer identified either by (c_id) or by last name (c_last).
+          Here we will use c_id directly.
+        - h_amount in [1.00, 5000.00]
+        - payment is usually local: c_w_id=w_id and c_d_id=d_id
+
+        Respond ONLY with:
+        {
+          "w_id": 1,
+          "d_id": 1,
+          "c_id": 1,
+          "h_amount": 10.00,
+          "h_date_iso": "2025-12-18T16:00:00"
+        }
+      inputs:
+        - user_query
+      outputs:
+        - w_id
+        - d_id
+        - c_id
+        - h_amount
+        - h_date_iso
+
+    # ===== 2) Branch A: context reads (DB) =====
+    - id: pay_ctx_reads_db_qwen14b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      db_queries:
+        - name: tpcc_pay_select_warehouse
+          sql: >
+            SELECT w_name, w_street_1, w_street_2, w_city, w_state, w_zip
+            FROM bmsql_warehouse
+            WHERE w_id = :w_id;
+          parameters:
+            w_id: "{{ w_id }}"
+          param_types:
+            w_id: int
+
+        - name: tpcc_pay_select_district
+          sql: >
+            SELECT d_name, d_street_1, d_street_2, d_city, d_state, d_zip
+            FROM bmsql_district
+            WHERE d_w_id = :w_id AND d_id = :d_id;
+          parameters:
+            w_id: "{{ w_id }}"
+            d_id: "{{ d_id }}"
+          param_types:
+            w_id: int
+            d_id: int
+
+        - name: tpcc_pay_select_customer
+          sql: >
+            SELECT c_first, c_middle, c_last, c_street_1, c_street_2, c_city, c_state, c_zip,
+                   c_phone, c_since, c_credit, c_credit_lim, c_discount, c_balance
+            FROM bmsql_customer
+            WHERE c_w_id = :w_id AND c_d_id = :d_id AND c_id = :c_id;
+          parameters:
+            w_id: "{{ w_id }}"
+            d_id: "{{ d_id }}"
+            c_id: "{{ c_id }}"
+          param_types:
+            w_id: int
+            d_id: int
+            c_id: int
+      system_prompt: |
+        Summarize the payment context from DB results.
+        Do not invent values. If any query returns empty, set ctx_ok=false.
+
+        Respond ONLY with:
+        {
+          "ctx_ok": true,
+          "w_name": "string",
+          "d_name": "string",
+          "c_name": "string",
+          "c_credit": "string",
+          "c_discount": 0.0,
+          "c_balance_before": 0.0,
+          "ctx_notes": "string"
+        }
+      inputs:
+        - user_query
+        - w_id
+        - d_id
+        - c_id
+        - h_amount
+      outputs:
+        - ctx_ok
+        - w_name
+        - d_name
+        - c_name
+        - c_credit
+        - c_discount
+        - c_balance_before
+        - ctx_notes
+
+    # ===== 3) Branch A2: LLM "explain intent" (LLM-only) =====
+    - id: pay_ctx_reason_openai20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        Given ctx_notes and payment amount, explain:
+        - who is being paid (customer)
+        - which warehouse/district receive ytd increments
+        - what fields should change
+
+        Respond ONLY with:
+        {
+          "expected_effects": "string"
+        }
+      inputs:
+        - user_query
+        - ctx_ok
+        - ctx_notes
+        - w_name
+        - d_name
+        - c_name
+        - c_credit
+        - c_balance_before
+        - h_amount
+      outputs:
+        - expected_effects
+
+    # ===== 4) Branch B: writes (DB) =====
+    - id: pay_writes_db_qwen32b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+      db_queries:
+        - name: tpcc_pay_update_warehouse
+          sql: >
+            UPDATE bmsql_warehouse
+            SET w_ytd = w_ytd + :h_amount
+            WHERE w_id = :w_id;
+          parameters:
+            w_id: "{{ w_id }}"
+            h_amount: "{{ h_amount }}"
+          param_types:
+            w_id: int
+            h_amount: float
+
+        - name: tpcc_pay_update_district
+          sql: >
+            UPDATE bmsql_district
+            SET d_ytd = d_ytd + :h_amount
+            WHERE d_w_id = :w_id AND d_id = :d_id;
+          parameters:
+            w_id: "{{ w_id }}"
+            d_id: "{{ d_id }}"
+            h_amount: "{{ h_amount }}"
+          param_types:
+            w_id: int
+            d_id: int
+            h_amount: float
+
+        # 注意：BenchmarkSQL 有两种 customer update（带 c_data 或不带）
+        # 这里走“不带 c_data”的基本路径，保证 SQL 可执行。
+        - name: tpcc_pay_update_customer_basic
+          sql: >
+            UPDATE bmsql_customer
+            SET c_balance = c_balance - :h_amount,
+                c_ytd_payment = c_ytd_payment + :h_amount,
+                c_payment_cnt = c_payment_cnt + 1
+            WHERE c_w_id = :w_id AND c_d_id = :d_id AND c_id = :c_id;
+          parameters:
+            w_id: "{{ w_id }}"
+            d_id: "{{ d_id }}"
+            c_id: "{{ c_id }}"
+            h_amount: "{{ h_amount }}"
+          param_types:
+            w_id: int
+            d_id: int
+            c_id: int
+            h_amount: float
+
+        - name: tpcc_pay_insert_history
+          sql: >
+            INSERT INTO bmsql_history (
+              h_c_id, h_c_d_id, h_c_w_id, h_d_id, h_w_id, h_date, h_amount, h_data
+            )
+            VALUES (
+              :c_id, :d_id, :w_id, :d_id, :w_id, :h_date, :h_amount, :h_data
+            );
+          parameters:
+            c_id: "{{ c_id }}"
+            d_id: "{{ d_id }}"
+            w_id: "{{ w_id }}"
+            h_date: "{{ h_date_iso }}"
+            h_amount: "{{ h_amount }}"
+            h_data: "{{ w_id }}-{{ d_id }} payment"
+          param_types:
+            c_id: int
+            d_id: int
+            w_id: int
+            h_date: text
+            h_amount: float
+            h_data: text
+
+        # 写完后读回 customer balance 作为“效果观测”
+        - name: tpcc_pay_read_customer_after
+          sql: >
+            SELECT c_balance
+            FROM bmsql_customer
+            WHERE c_w_id = :w_id AND c_d_id = :d_id AND c_id = :c_id;
+          parameters:
+            w_id: "{{ w_id }}"
+            d_id: "{{ d_id }}"
+            c_id: "{{ c_id }}"
+          param_types:
+            w_id: int
+            d_id: int
+            c_id: int
+      system_prompt: |
+        From the post-write readback, extract c_balance_after.
+        Respond ONLY with:
+        {
+          "write_ok": true,
+          "c_balance_after": 0.0,
+          "write_notes": "string"
+        }
+      inputs:
+        - w_id
+        - d_id
+        - c_id
+        - h_amount
+        - h_date_iso
+      outputs:
+        - write_ok
+        - c_balance_after
+        - write_notes
+
+    # ===== 5) Join: reconcile + final answer (LLM-only) =====
+    - id: pay_join_reconcile_openai20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        Join the read-context branch and write branch:
+        - If ctx_ok or write_ok is false, explain failure.
+        - Otherwise check that c_balance_after ~= c_balance_before - h_amount.
+        - Produce a human-readable transaction trace and a short reasoning summary.
+
+        Respond ONLY with:
+        {
+          "final_answer": "string",
+          "reconcile_ok": true
+        }
+      inputs:
+        - user_query
+        - w_id
+        - d_id
+        - c_id
+        - h_amount
+        - h_date_iso
+        - ctx_ok
+        - w_name
+        - d_name
+        - c_name
+        - c_credit
+        - c_discount
+        - c_balance_before
+        - ctx_notes
+        - expected_effects
+        - write_ok
+        - c_balance_after
+        - write_notes
+      outputs:
+        - final_answer
+        - reconcile_ok
+
+  edges:
+    - from: user_input
+      to: tpcc_payment_param_planner_openai20b
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: tpcc_payment_param_planner_openai20b
+      to: pay_ctx_reads_db_qwen14b
+      mapping:
+        user_query: "{{ user_query }}"
+        w_id: "{{ w_id }}"
+        d_id: "{{ d_id }}"
+        c_id: "{{ c_id }}"
+        h_amount: "{{ h_amount }}"
+
+    - from: pay_ctx_reads_db_qwen14b
+      to: pay_ctx_reason_openai20b
+      mapping:
+        user_query: "{{ user_query }}"
+        ctx_ok: "{{ ctx_ok }}"
+        ctx_notes: "{{ ctx_notes }}"
+        w_name: "{{ w_name }}"
+        d_name: "{{ d_name }}"
+        c_name: "{{ c_name }}"
+        c_credit: "{{ c_credit }}"
+        c_balance_before: "{{ c_balance_before }}"
+        h_amount: "{{ h_amount }}"
+
+    - from: tpcc_payment_param_planner_openai20b
+      to: pay_writes_db_qwen32b
+      mapping:
+        w_id: "{{ w_id }}"
+        d_id: "{{ d_id }}"
+        c_id: "{{ c_id }}"
+        h_amount: "{{ h_amount }}"
+        h_date_iso: "{{ h_date_iso }}"
+
+    - from: tpcc_payment_param_planner_openai20b
+      to: pay_join_reconcile_openai20b
+      mapping:
+        user_query: "{{ user_query }}"
+        w_id: "{{ w_id }}"
+        d_id: "{{ d_id }}"
+        c_id: "{{ c_id }}"
+        h_amount: "{{ h_amount }}"
+        h_date_iso: "{{ h_date_iso }}"
+
+    - from: pay_ctx_reads_db_qwen14b
+      to: pay_join_reconcile_openai20b
+      mapping:
+        ctx_ok: "{{ ctx_ok }}"
+        w_name: "{{ w_name }}"
+        d_name: "{{ d_name }}"
+        c_name: "{{ c_name }}"
+        c_credit: "{{ c_credit }}"
+        c_discount: "{{ c_discount }}"
+        c_balance_before: "{{ c_balance_before }}"
+        ctx_notes: "{{ ctx_notes }}"
+
+    - from: pay_ctx_reason_openai20b
+      to: pay_join_reconcile_openai20b
+      mapping:
+        expected_effects: "{{ expected_effects }}"
+
+    - from: pay_writes_db_qwen32b
+      to: pay_join_reconcile_openai20b
+      mapping:
+        write_ok: "{{ write_ok }}"
+        c_balance_after: "{{ c_balance_after }}"
+        write_notes: "{{ write_notes }}"

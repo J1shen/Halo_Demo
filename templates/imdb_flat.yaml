@@ -1,0 +1,419 @@
+graph:
+  name: imdb_qa_agent_flat_1_7_1
+  description: >
+    Flat IMDb workflow with 1 root LLM, 7 parallel LLM branches (3 DB-backed,
+    4 HTTP-backed), and 1 final LLM merge.
+
+  nodes:
+    - id: user_input
+      type: input
+      outputs:
+        - user_query
+
+    # ===== root: keyword planner =====
+    - id: keyword_planner
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        You are a keyword planning assistant for an IMDb-like database.
+        Given user_query, produce a concise search_keyword suitable for ILIKE
+        on titles, names, and related text fields.
+        Respond ONLY with:
+        {
+          "search_keyword": "string"
+        }
+      inputs:
+        - user_query
+      outputs:
+        - search_keyword
+
+    # ===== 7 parallel LLM branches =====
+    - id: movie_overview_llm
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      db_queries:
+        - name: imdb_movie_overview_main
+          sql: >
+            SELECT
+              b.tconst,
+              b.primary_title,
+              b.start_year,
+              r.average_rating,
+              r.num_votes
+            FROM title_basics AS b
+            LEFT JOIN title_ratings AS r
+              ON r.tconst = b.tconst
+            WHERE
+              b.title_type IN ('movie','tvMovie','tvSeries')
+              AND (
+                b.primary_title     ILIKE '%%' || :keyword || '%%'
+                OR b.original_title ILIKE '%%' || :keyword || '%%'
+              )
+            ORDER BY COALESCE(r.num_votes,0) DESC,
+                     COALESCE(r.average_rating,0) DESC,
+                     b.start_year DESC NULLS LAST
+            LIMIT 20;
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+      system_prompt: |
+        Movie branch: overview.
+        Use imdb_movie_overview_main to summarize relevant titles.
+        Respond ONLY with:
+        {
+          "movie_overview": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+      outputs:
+        - movie_overview
+
+    - id: people_overview_llm
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      db_queries:
+        - name: imdb_people_overview_main
+          sql: >
+            SELECT
+              n.nconst,
+              n.primary_name,
+              n.primary_profession,
+              n.known_for_titles
+            FROM name_basics AS n
+            WHERE
+              n.primary_name ILIKE '%%' || :keyword || '%%'
+            ORDER BY n.primary_name
+            LIMIT 20;
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+      system_prompt: |
+        People branch: overview.
+        Use imdb_people_overview_main to summarize relevant people.
+        Respond ONLY with:
+        {
+          "people_overview": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+      outputs:
+        - people_overview
+
+    - id: crew_overview_llm
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      db_queries:
+        - name: imdb_crew_by_title_keyword
+          sql: >
+            SELECT
+              b.tconst,
+              b.primary_title,
+              b.start_year,
+              c.directors,
+              c.writers
+            FROM title_basics AS b
+            JOIN title_crew AS c
+              ON c.tconst = b.tconst
+            WHERE
+              b.title_type IN ('movie','tvMovie','tvSeries')
+              AND (
+                b.primary_title     ILIKE '%%' || :keyword || '%%'
+                OR b.original_title ILIKE '%%' || :keyword || '%%'
+              )
+            ORDER BY b.start_year DESC NULLS LAST
+            LIMIT 20;
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+      system_prompt: |
+        Crew branch: overview.
+        Use imdb_crew_by_title_keyword to summarize directors/writers.
+        Respond ONLY with:
+        {
+          "crew_overview": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+      outputs:
+        - crew_overview
+
+    - id: http_delay_10s_llm
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+      system_prompt: |
+        External titles enrichment.
+        Use http_delay_10s payload to extract title-level context (themes, era,
+        genre, or any salient metadata that helps answer user_query).
+        Respond ONLY with:
+        {
+          "external_title_context": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+        - http_delay_10s
+      outputs:
+        - external_title_context
+
+    - id: http_delay_5s_llm
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        External people/crew enrichment.
+        Use http_delay_5s payload to extract people or crew context, such as
+        notable names, roles, or reputational signals relevant to user_query.
+        Respond ONLY with:
+        {
+          "external_people_context": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+        - http_delay_5s
+      outputs:
+        - external_people_context
+
+    - id: http_delay_0_5s_a_llm
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        External quick signal A.
+        Use http_delay_0_5s_a and http_delay_0_5s_b payloads to extract fast
+        signals like popularity, recency, or buzz that could guide the final answer.
+        Respond ONLY with:
+        {
+          "external_popularity_signal": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+        - http_delay_0_5s_a
+        - http_delay_0_5s_b
+      outputs:
+        - external_popularity_signal
+
+    - id: http_delay_0_5s_b_llm
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        External quick signal B.
+        Use http_delay_0_5s_a and http_delay_0_5s_b payloads to extract
+        availability or format hints (platform, medium, release status) if present.
+        Respond ONLY with:
+        {
+          "external_availability_signal": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+        - http_delay_0_5s_a
+        - http_delay_0_5s_b
+      outputs:
+        - external_availability_signal
+
+    # ===== HTTP prefetch nodes =====
+    - id: http_delay_10s
+      type: http
+      engine: http
+      sleep_s: 10
+      inputs:
+        - search_keyword
+      outputs:
+        - http_delay_10s
+
+    - id: http_delay_5s
+      type: http
+      engine: http
+      sleep_s: 5
+      inputs:
+        - search_keyword
+      outputs:
+        - http_delay_5s
+
+    - id: http_delay_0_5s_a
+      type: http
+      engine: http
+      sleep_s: 0.5
+      inputs:
+        - search_keyword
+      outputs:
+        - http_delay_0_5s_a
+
+    - id: http_delay_0_5s_b
+      type: http
+      engine: http
+      sleep_s: 0.5
+      inputs:
+        - search_keyword
+      outputs:
+        - http_delay_0_5s_b
+
+    # ===== final merge =====
+    - id: final_answer
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        Final answer assistant.
+        Combine outputs from the 7 parallel branches into a grounded answer.
+        Respond ONLY with:
+        {
+          "final_answer": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+        - movie_overview
+        - people_overview
+        - crew_overview
+        - external_title_context
+        - external_people_context
+        - external_popularity_signal
+        - external_availability_signal
+      outputs:
+        - final_answer
+
+  edges:
+    - from: user_input
+      to: keyword_planner
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: user_input
+      to: final_answer
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: keyword_planner
+      to: movie_overview_llm
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+
+    - from: keyword_planner
+      to: people_overview_llm
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+
+    - from: keyword_planner
+      to: crew_overview_llm
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+
+    - from: keyword_planner
+      to: http_delay_10s
+      mapping:
+        search_keyword: "{{ search_keyword }}"
+
+    - from: keyword_planner
+      to: http_delay_5s
+      mapping:
+        search_keyword: "{{ search_keyword }}"
+
+    - from: keyword_planner
+      to: http_delay_0_5s_a
+      mapping:
+        search_keyword: "{{ search_keyword }}"
+
+    - from: keyword_planner
+      to: http_delay_0_5s_b
+      mapping:
+        search_keyword: "{{ search_keyword }}"
+
+    - from: http_delay_10s
+      to: http_delay_10s_llm
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+        http_delay_10s: "{{ http_delay_10s }}"
+
+    - from: http_delay_5s
+      to: http_delay_5s_llm
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+        http_delay_5s: "{{ http_delay_5s }}"
+
+    - from: http_delay_0_5s_a
+      to: http_delay_0_5s_a_llm
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+        http_delay_0_5s_a: "{{ http_delay_0_5s_a }}"
+
+    - from: http_delay_0_5s_b
+      to: http_delay_0_5s_a_llm
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+        http_delay_0_5s_b: "{{ http_delay_0_5s_b }}"
+
+    - from: http_delay_0_5s_a
+      to: http_delay_0_5s_b_llm
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+        http_delay_0_5s_a: "{{ http_delay_0_5s_a }}"
+
+    - from: http_delay_0_5s_b
+      to: http_delay_0_5s_b_llm
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+        http_delay_0_5s_b: "{{ http_delay_0_5s_b }}"
+
+    - from: keyword_planner
+      to: final_answer
+      mapping:
+        search_keyword: "{{ search_keyword }}"
+
+    - from: movie_overview_llm
+      to: final_answer
+      mapping:
+        movie_overview: "{{ movie_overview }}"
+
+    - from: people_overview_llm
+      to: final_answer
+      mapping:
+        people_overview: "{{ people_overview }}"
+
+    - from: crew_overview_llm
+      to: final_answer
+      mapping:
+        crew_overview: "{{ crew_overview }}"
+
+    - from: http_delay_10s_llm
+      to: final_answer
+      mapping:
+        external_title_context: "{{ external_title_context }}"
+
+    - from: http_delay_5s_llm
+      to: final_answer
+      mapping:
+        external_people_context: "{{ external_people_context }}"
+
+    - from: http_delay_0_5s_a_llm
+      to: final_answer
+      mapping:
+        external_popularity_signal: "{{ external_popularity_signal }}"
+
+    - from: http_delay_0_5s_b_llm
+      to: final_answer
+      mapping:
+        external_availability_signal: "{{ external_availability_signal }}"

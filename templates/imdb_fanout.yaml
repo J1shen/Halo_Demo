@@ -1,0 +1,305 @@
+graph:
+  name: imdb_qa_agent_fanout_barrier_5node
+  description: >
+    5-node IMDb QA workflow with explicit fanout/barrier structure:
+    A (Qwen 14B) parses keywords, then fanouts to B and C.
+    After both B and C finish, D and E run.
+    B/D share Qwen 32B, C/E share openai/gpt-oss-20b, so the optimizer
+    can co-locate same-model nodes on the same worker to avoid reloads.
+
+  nodes:
+    # ===== Node A: Keyword 解析 (Qwen 14B) =====
+    - id: keyword_planner
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        You are a keyword planning assistant for an IMDb-like QA system.
+
+        Given a user_query about movies or people, you must:
+        - Extract a short comma-separated search keyword string for SQL ILIKE filters.
+        - Optionally infer key years, genres, or names for DB queries.
+
+        Respond ONLY with a single valid JSON object, no extra text and no markdown:
+        {
+          "search_keyword": "keyword1, keyword2"
+        }
+
+        Requirements:
+        - Do NOT add any other keys.
+        - "search_keyword" should be concise but informative enough for DB filtering.
+      inputs:
+        - user_query
+      outputs:
+        - search_keyword
+
+    # ===== Node B: 分支一（Qwen 32B + DB） =====
+    # 使用 Qwen 32B，和 D 共用模型；optimizer 可将 B、D 放同一个 32B worker。
+    - id: branch_b_qwen32b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+
+      db_queries:
+        - name: b_movie_retrieval
+          sql: >
+            SELECT
+              b.tconst,
+              b.primary_title,
+              b.start_year,
+              b.genres,
+              r.average_rating,
+              r.num_votes
+            FROM title_basics AS b
+            LEFT JOIN title_ratings AS r
+              ON r.tconst = b.tconst
+            WHERE b.title_type IN ('movie', 'tvMovie', 'tvSeries')
+              AND (
+                b.primary_title ILIKE '%%' || :keyword || '%%'
+                OR b.original_title ILIKE '%%' || :keyword || '%%'
+              )
+            ORDER BY
+              COALESCE(r.num_votes, 0) DESC,
+              COALESCE(r.average_rating, 0) DESC,
+              b.start_year DESC
+            LIMIT 40;
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+
+      system_prompt: |
+        You are branch B, a Qwen 32B-based movie-centric summarizer.
+
+        Inputs:
+        - user_query
+        - search_keyword (from the keyword planner)
+        - SQL: b_movie_retrieval
+
+        Task:
+        - Produce a short movie-centric summary focusing on the most relevant titles.
+        - This summary is mainly for logging / debugging; downstream nodes do NOT
+          have to depend on it.
+
+        Respond ONLY with:
+        {
+          "b_summary": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+      outputs:
+        - b_summary
+
+    # ===== Node C: 分支二（openai/gpt-oss-20b + DB） =====
+    # 使用 openai 20B，和 E 共用模型；optimizer 可将 C、E 放同一个 20B worker。
+    - id: branch_c_openai20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+
+      db_queries:
+        - name: c_person_retrieval
+          sql: >
+            SELECT
+              n.nconst,
+              n.primary_name,
+              n.primary_profession,
+              n.known_for_titles
+            FROM name_basics AS n
+            WHERE n.primary_name ILIKE '%%' || :keyword || '%%'
+            ORDER BY n.primary_name
+            LIMIT 40;
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+
+      system_prompt: |
+        You are branch C, an openai 20B-based people-centric summarizer.
+
+        Inputs:
+        - user_query
+        - search_keyword
+        - SQL: c_person_retrieval
+
+        Task:
+        - Produce a short people-centric summary (actors, directors, etc.).
+        - This summary is mainly for logging / debugging; downstream nodes do NOT
+          have to depend on it.
+
+        Respond ONLY with:
+        {
+          "c_summary": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+      outputs:
+        - c_summary
+
+    # ===== Node D: 深度分析器（Qwen 32B） =====
+    # 使用 Qwen 32B，与 B 共用模型。逻辑上只依赖 user_query + search_keyword，
+    # 不强制依赖 B 的输出，但通过边保证执行顺序在 B/C 之后。
+    - id: deep_analyzer_qwen32b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+
+      db_queries:
+        - name: d_joined_context
+          sql: >
+            SELECT
+              b.tconst,
+              b.primary_title,
+              b.start_year,
+              r.average_rating,
+              r.num_votes,
+              c.directors,
+              c.writers
+            FROM title_basics AS b
+            LEFT JOIN title_ratings AS r
+              ON r.tconst = b.tconst
+            LEFT JOIN title_crew AS c
+              ON c.tconst = b.tconst
+            WHERE b.title_type IN ('movie', 'tvMovie', 'tvSeries')
+              AND (
+                b.primary_title ILIKE '%%' || :keyword || '%%'
+                OR b.original_title ILIKE '%%' || :keyword || '%%'
+              )
+            ORDER BY
+              COALESCE(r.num_votes, 0) DESC,
+              COALESCE(r.average_rating, 0) DESC,
+              b.start_year DESC
+            LIMIT 30;
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+
+      system_prompt: |
+        You are a deep analyzer using Qwen 32B.
+
+        Inputs:
+        - user_query
+        - search_keyword
+        - SQL: d_joined_context
+
+        Tasks:
+        - Perform deeper reasoning about likely intent and candidate movies.
+        - Produce a structured analysis that can be used by the final answer node.
+        - You do NOT need B/C summaries; they are executed earlier only to respect
+          the required ordering and for potential logging.
+
+        Respond ONLY with:
+        {
+          "analysis_notes": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+      outputs:
+        - analysis_notes
+
+    # ===== Node E: 最终回答器（openai/gpt-oss-20b） =====
+    # 使用 openai/gpt-oss-20b，与 C 共用模型；只依赖 user_query + search_keyword + analysis_notes。
+    # 不直接使用 B/C 输出，但通过图结构保证 E 在 B/C 之后执行。
+    - id: final_answer_openai20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+
+      db_queries:
+        - name: e_focused_context
+          sql: >
+            SELECT
+              b.tconst,
+              b.primary_title,
+              b.start_year,
+              b.genres,
+              r.average_rating,
+              r.num_votes
+            FROM title_basics AS b
+            LEFT JOIN title_ratings AS r
+              ON r.tconst = b.tconst
+            WHERE b.title_type IN ('movie', 'tvMovie', 'tvSeries')
+              AND (
+                b.primary_title ILIKE '%%' || :keyword || '%%'
+                OR b.original_title ILIKE '%%' || :keyword || '%%'
+              )
+            ORDER BY
+              COALESCE(r.num_votes, 0) DESC,
+              COALESCE(r.average_rating, 0) DESC,
+              b.start_year DESC
+            LIMIT 20;
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+
+      system_prompt: |
+        You are the final-answer assistant using openai/gpt-oss-20b.
+
+        Inputs:
+        - user_query
+        - search_keyword
+        - analysis_notes (from the deep analyzer)
+        - SQL: e_focused_context
+
+        Task:
+        - Produce a final natural-language answer grounded in the SQL data.
+        - If multiple movies/people are plausible, explain the ambiguity and list
+          top candidates with titles and years.
+
+        Respond ONLY with:
+        {
+          "final_answer": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+        - analysis_notes
+      outputs:
+        - final_answer
+
+  edges:
+    # A: user_input -> keyword_planner
+    - from: user_input
+      to: keyword_planner
+      mapping:
+        user_query: "{{ user_query }}"
+
+    # A fanout B/C：keyword_planner -> B / C
+    - from: keyword_planner
+      to: branch_b_qwen32b
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+
+    - from: keyword_planner
+      to: branch_c_openai20b
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+
+    # BC 后执行 D/E：
+    # 虽然 D/E 逻辑上只需要 user_query + search_keyword，但通过图结构强制它们
+    # 在 B/C 之后：给 D/E 各加上来自 B 和 C 的边（mapping 仍然只用 user_query/search_keyword）。
+    - from: branch_b_qwen32b
+      to: deep_analyzer_qwen32b
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+
+    - from: branch_c_openai20b
+      to: deep_analyzer_qwen32b
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+
+    - from: deep_analyzer_qwen32b
+      to: final_answer_openai20b
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+        analysis_notes: "{{ analysis_notes }}"
